@@ -1,6 +1,6 @@
 {
   "name": "obsidian-prism",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Obsidian Prism (黑曜棱镜) — Optical UI & Motion Suite for Antigravity. Unified 4-tier spring choreography, daylight crystal themes, 512K telemetry vial, reasoning effort slider, and dual-mode thought translator.",
   "license": "GPL-3.0-only",
   "author": "RMvdesi",
@@ -27,6 +27,7 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.mjs",
+    "workbench": "node workbench/server.cjs",
     "inject": "node inject.js",
     "watch": "node inject.js --watch",
     "daemon": "node sidecars/daemon/main.mjs",
