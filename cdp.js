@@ -4920,7 +4920,7 @@ function getInjectWrapperTemplate() {
         style.id = ${JSON.stringify(STYLE_ID)};
       }
       const flatKey = __AG_INJ_CSSHASH__;
-      if (style.getAttribute?.('data-ag-cs-flat') !== flatKey) {
+      if (style.getAttribute?.('data-ag-cs-flat') !== flatKey + ':' + (style.textContent || '').length) {
         const css = getCss();
         if (style.textContent !== css) style.textContent = css;
         style.removeAttribute?.('data-ag-cs-flat');

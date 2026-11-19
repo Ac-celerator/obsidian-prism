@@ -1149,7 +1149,7 @@
     const el = document.getElementById?.('ag-prism-css');
     const rules = el?.sheet?.cssRules;
     const key = el?.getAttribute?.('data-ag-cs-css-hash') || CODE_HASH || '1';
-    if (!rules?.length || el.getAttribute?.('data-ag-cs-flat') === key) return;
+    if (!rules?.length || el.getAttribute?.('data-ag-cs-flat') === key + ':' + (el.textContent || '').length) return;
     const splitC = (s) => {
       const out = [];
       for (let i = 0, d = 0, q = '', st = 0; i <= s.length; i++) {
@@ -1220,7 +1220,7 @@
     };
     try {
       const flat = walk(rules, '').join('\n');
-      if (flat) runGuardedMut(() => { el.textContent = flat; el.setAttribute?.('data-ag-cs-flat', key); });
+      if (flat) runGuardedMut(() => { el.textContent = flat; el.setAttribute?.('data-ag-cs-flat', key + ':' + flat.length); });
     } catch {}
   }
 

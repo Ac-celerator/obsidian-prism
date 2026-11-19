@@ -492,10 +492,15 @@ test('perf guard 11: style.css enables offscreen content-visibility, sidebar con
     document: { getElementById: (id) => (id === 'ag-prism-css' ? fakeStyle : null) },
   };
   vm.runInNewContext(`${fnMatch[0]}; flattenMainStyleSheet();`, sb);
-  assert.equal(attrs.get('data-ag-cs-flat'), 'h1');
+  assert.equal(attrs.get('data-ag-cs-flat'), `h1:${fakeStyle.textContent.length}`);
   assert.ok(fakeStyle.textContent.includes('html[data-ag-cs-style] .a,html[data-ag-cs-style] [data-b="1"]{color: red;}'));
   assert.ok(fakeStyle.textContent.includes('@keyframes k{to{opacity:1}}'));
   assert.equal(fakeStyle.textContent.includes(':is('), false);
+  // If an older watcher overwrites textContent without clearing data-ag-cs-flat, length mismatch forces immediate re-flatten
+  fakeStyle.textContent = '/* stale unflattened css */';
+  vm.runInNewContext(`${fnMatch[0]}; flattenMainStyleSheet();`, sb);
+  assert.equal(attrs.get('data-ag-cs-flat'), `h1:${fakeStyle.textContent.length}`);
+  assert.ok(fakeStyle.textContent.includes('html[data-ag-cs-style] .a,html[data-ag-cs-style] [data-b="1"]{color: red;}'));
 });
 
 test('perf guard 12: prism-rim-canvas skips canvas resize when inactive and stream-choreography avoids hover getBoundingClientRect reflows', () => {
