@@ -154,6 +154,17 @@
     const boundIframes = new WeakSet();
     const iframeUnsubscribers = [];
 
+    const pruneUnsubs = (list, all, boundSet) => {
+      for (let i = list.length - 1; i >= 0; i--) {
+        const rec = list[i];
+        if (all || (rec && rec.el && rec.el.isConnected === false)) {
+          list.splice(i, 1);
+          if (rec?.el && boundSet) boundSet.delete(rec.el);
+          try { (typeof rec === 'function' ? rec : rec?.unsub)?.(); } catch {}
+        }
+      }
+    };
+
     const codeLineCache = new WeakMap();
     const preSyncCache = new WeakMap();
     const boundFoldBtns = new WeakSet();
@@ -170,6 +181,7 @@
     let outlineFoldBtn = null;
     let outlineFilterText = '';
     let outlineOpen = false;
+    let lastOutlineSig = '';
     let hideOutlineTimer = 0;
     let foldFeedbackTimer = 0;
     const sonarTimers = new Set();
@@ -351,6 +363,8 @@
       const sample = needsSample ? sampleRootTheme(forceSample) : cachedThemeSample;
       if (!sample) return;
 
+      pruneUnsubs(iframeUnsubscribers, false, boundIframes);
+
       for (let i = 0; i < iframes.length; i++) {
         const frame = iframes[i];
         if (!boundIframes.has(frame) && typeof frame.addEventListener === 'function') {
@@ -362,10 +376,13 @@
             pushThemeToIframe(frame, latest, true);
           };
           frame.addEventListener('load', onFrameLoad);
-          iframeUnsubscribers.push(() => {
-            try {
-              frame.removeEventListener('load', onFrameLoad);
-            } catch {}
+          iframeUnsubscribers.push({
+            el: frame,
+            unsub: () => {
+              try {
+                frame.removeEventListener('load', onFrameLoad);
+              } catch {}
+            },
           });
         }
         pushThemeToIframe(frame, sample, false);
@@ -511,8 +528,10 @@
       runGuardedMut(() => {
         for (let i = 0; i < pres.length; i++) {
           const pre = pres[i];
+          const hasDirectDiv = Array.from(pre.children || []).some((ch) => String(ch?.tagName || '').toUpperCase() === 'DIV');
+          if (hasDirectDiv) setAttrIfChanged(pre, 'data-ag-cs-rich-pre', '1');
+          else if (pre.hasAttribute?.('data-ag-cs-rich-pre')) pre.removeAttribute('data-ag-cs-rich-pre');
           const prevRec = preSyncCache.get(pre);
-          const inHistoricalTurn = Boolean(lastResp && !lastResp.contains?.(pre) && !pre.closest?.('[data-testid="artifact-view"]'));
           if (
             prevRec &&
             pre !== streamingPre &&
@@ -521,9 +540,12 @@
             (prevRec.lineCount < MIN_CODE_FOLD_LINES || (prevRec.btn && prevRec.btn.isConnected !== false && prevRec.btn.parentElement)) &&
             (prevRec.sealed || prevRec.stamp === getPreBodyStamp(prevRec.body))
           ) {
-            if (inHistoricalTurn && !prevRec.sealed) prevRec.sealed = true;
+            if (!prevRec.sealed && lastResp && !lastResp.contains?.(pre) && !pre.closest?.('[data-testid="artifact-view"]')) {
+              prevRec.sealed = true;
+            }
             continue;
           }
+          const inHistoricalTurn = Boolean(lastResp && !lastResp.contains?.(pre) && !pre.closest?.('[data-testid="artifact-view"]'));
 
           const parts = resolveCodeCardParts(pre);
           if (!parts) continue;
@@ -945,16 +967,27 @@
       return pop;
     }
 
-    function renderOutlineListOnly() {
+    function renderOutlineListOnly(forceRebuild = false) {
       if (!outlineListEl || !doc) return;
       const ui = getStrings();
       const model = collectOutlineModel(activeNavRail);
+      const q = outlineFilterText;
+      const sigParts = [lastSyncedLang, model.totalTurns, q, model.chapters.length, model.items.length];
+      for (let i = 0; i < model.chapters.length; i++) sigParts.push(model.chapters[i].label);
+      for (let i = 0; i < model.items.length; i++) {
+        const it = model.items[i];
+        sigParts.push(`${it.turnNum}:${it.active ? 1 : 0}:${it.text}`);
+      }
+      const nextSig = sigParts.join('\x1f');
+      if (!forceRebuild && nextSig === lastOutlineSig && outlineListEl.firstChild) {
+        return;
+      }
+      lastOutlineSig = nextSig;
       if (outlineTitleEl) outlineTitleEl.textContent = ui.outlineTitle(model.totalTurns);
 
       runGuardedMut(() => {
         while (outlineListEl.firstChild) outlineListEl.removeChild(outlineListEl.firstChild);
 
-        const q = outlineFilterText;
         let renderedCount = 0;
 
         for (let i = 0; i < model.chapters.length; i++) {
@@ -1076,6 +1109,7 @@
 
     function syncNavRails() {
       if (isDead() || !doc || typeof doc.querySelectorAll !== 'function') return;
+      pruneUnsubs(navRailUnsubscribers, false, boundNavRails);
       const rails = doc.querySelectorAll('[data-testid="conversation-navigator"]');
       for (let i = 0; i < rails.length; i++) {
         const rail = rails[i];
@@ -1089,18 +1123,25 @@
             }
             return;
           }
+          if (outlineOpen && activeNavRail === rail && outlinePopover && outlinePopover.isConnected !== false) {
+            cancelHideOutlineTimer();
+            return;
+          }
           openNavOutline(rail);
         };
         const onLeave = () => scheduleHideOutline();
         rail.addEventListener('pointerenter', onPointerHover);
         rail.addEventListener('pointerover', onPointerHover);
         rail.addEventListener('pointerleave', onLeave);
-        navRailUnsubscribers.push(() => {
-          try {
-            rail.removeEventListener('pointerenter', onPointerHover);
-            rail.removeEventListener('pointerover', onPointerHover);
-            rail.removeEventListener('pointerleave', onLeave);
-          } catch {}
+        navRailUnsubscribers.push({
+          el: rail,
+          unsub: () => {
+            try {
+              rail.removeEventListener('pointerenter', onPointerHover);
+              rail.removeEventListener('pointerover', onPointerHover);
+              rail.removeEventListener('pointerleave', onLeave);
+            } catch {}
+          },
         });
       }
       if (outlineOpen && outlinePopover && outlinePopover.isConnected !== false) {
@@ -1170,14 +1211,8 @@
           win.removeEventListener('keydown', onWinKeyDown);
         } catch {}
       }
-      while (iframeUnsubscribers.length > 0) {
-        const fn = iframeUnsubscribers.pop();
-        fn();
-      }
-      while (navRailUnsubscribers.length > 0) {
-        const fn = navRailUnsubscribers.pop();
-        fn();
-      }
+      pruneUnsubs(iframeUnsubscribers, true, boundIframes);
+      pruneUnsubs(navRailUnsubscribers, true, boundNavRails);
 
       if (doc && typeof doc.querySelectorAll === 'function') {
         runGuardedMut(() => {

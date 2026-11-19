@@ -2790,7 +2790,7 @@
     // 迷你蟹坐标：translateX 相对迷你堆左缘（宿主 left 12px），精灵中心在画布 20px 处
     const crabHostCenter = (mc) => 12 + mc.lastX + 20;
     const crabSafeX = (x) => Math.min(clampActorX(9999) - 132, Math.max(2, Math.round(x)));
-    const crabMaxX = () => Math.max(40, (hostEl.clientWidth || 720) - 52);
+    const crabMaxX = () => Math.max(40, readStageWidth() - 52);
     const nearestFreeCrab = (hx) =>
       miniCrabs
         .filter((mc) => !mc.act || tickIdx - mc.act.start < 0)
@@ -2952,7 +2952,7 @@
         return;
       }
       fxCanvasCleared = false;
-      const wCss = Math.max(240, hostEl.clientWidth || 720);
+      const wCss = Math.max(240, readStageWidth());
       const hCss = 160;
       const tw = Math.round(wCss * dpr);
       const th = Math.round(hCss * dpr);
@@ -4073,6 +4073,17 @@
       let prev = performance.now();
       const step = (now) => {
         if (disposed || flightId !== actor.flying || actor.dragging) return;
+        if (doc && doc.hidden) {
+          actor.y = 0;
+          actor.vx = 0;
+          actor.vy = 0;
+          actor.rot = 0;
+          actor.overridePose = null;
+          actor.overrideRot = 0;
+          enforceGroundSeparation();
+          applyActorTransform(actor);
+          return;
+        }
         const k = Math.max(0.5, Math.min(2.5, (now - prev) / 16.6667));
         prev = now;
         vy += 0.44 * k;
@@ -4081,7 +4092,7 @@
         actor.x += vx * k;
         actor.y += vy * k;
 
-        const w = hostEl.clientWidth || 720;
+        const w = readStageWidth();
         const minX = 8;
         const maxX = Math.max(40, w - 88);
         if (actor.x < minX) {
@@ -5169,6 +5180,13 @@
         } catch (_) {
           /* 忽略 */
         }
+        pairCooldowns.clear();
+        try {
+          if (fxCanvas) { fxCanvas.width = 0; fxCanvas.height = 0; }
+          for (const a of [actors.cat, actors.clawd]) {
+            if (a?.canvas?.__agRotOff) { a.canvas.__agRotOff.width = 0; a.canvas.__agRotOff.height = 0; a.canvas.__agRotOff = null; }
+          }
+        } catch (_) {}
         cleanups.forEach((fn) => fn());
         for (const node of [miniGroupEl, actors.cat.el, actors.clawd.el, fxCanvas]) {
           if (node) {

@@ -82,9 +82,21 @@ export class TrajectoryReader {
    }
    const steps=incremental?old.trajectory.steps.slice(0,stepOffset):[];
    const generators=incremental?old.trajectory.generatorMetadata.slice(0,metadataOffset):[];
-   let bytes=Buffer.byteLength(JSON.stringify({steps,generatorMetadata:generators}));const deadline=this.client.now()+30000;
-   const append=(target,items)=>{
-    for(const item of items){bytes+=Buffer.byteLength(JSON.stringify(item))+1;if(bytes>this.budgetBytes)throw budgetError('projected-json',bytes,this.budgetBytes);target.push(item);}
+   const stepSizes=incremental&&Array.isArray(entry.stepSizes)?entry.stepSizes.slice(0,stepOffset):null;
+   const genSizes=incremental&&Array.isArray(entry.genSizes)?entry.genSizes.slice(0,metadataOffset):null;
+   let bytes=0;
+   if(stepSizes&&genSizes&&stepSizes.length===steps.length&&genSizes.length===generators.length){
+    bytes=35;
+    for(let i=0;i<stepSizes.length;i++)bytes+=stepSizes[i];
+    for(let i=0;i<genSizes.length;i++)bytes+=genSizes[i];
+   }else{
+    bytes=Buffer.byteLength(JSON.stringify({steps,generatorMetadata:generators}));
+   }
+   const nextStepSizes=stepSizes&&stepSizes.length===steps.length?stepSizes:steps.map(item=>Buffer.byteLength(JSON.stringify(item))+1);
+   const nextGenSizes=genSizes&&genSizes.length===generators.length?genSizes:generators.map(item=>Buffer.byteLength(JSON.stringify(item))+1);
+   const deadline=this.client.now()+30000;
+   const append=(target,items,sizes)=>{
+    for(const item of items){const itemBytes=Buffer.byteLength(JSON.stringify(item))+1;bytes+=itemBytes;if(bytes>this.budgetBytes)throw budgetError('projected-json',bytes,this.budgetBytes);target.push(item);sizes.push(itemBytes);}
    };
    const check=()=>{assertCurrent();if(this.client.now()>deadline)throw new Error('会话统计分页读取超时');};
    const stepPages=new Set(),metadataPages=new Set();let pageCount=0;
@@ -93,7 +105,7 @@ export class TrajectoryReader {
     const offset=steps.length;if(stepPages.has(offset))throw new Error('会话统计分页没有推进');stepPages.add(offset);
     const page=await this.client.call('GetCascadeTrajectorySteps',{cascadeId:id,stepOffset:offset,trajectoryVerbosity:3});check();
     const items=page.steps||[];if(!Array.isArray(items))throw new Error('会话统计分页格式无效');
-    if(!items.length){if(count===null)break;throw new Error('完整会话统计分页暂不可用');}append(steps,items);
+    if(!items.length){if(count===null)break;throw new Error('完整会话统计分页暂不可用');}append(steps,items,nextStepSizes);
     // Only compare stable item IDs. Some hosts legitimately return structurally
     // identical marker objects on adjacent offsets; treating their full JSON as
     // a page identity would reject valid pagination. A repeated offset is still
@@ -108,7 +120,7 @@ export class TrajectoryReader {
     const offset=generators.length;if(metadataPages.has(offset))throw new Error('会话统计分页没有推进');metadataPages.add(offset);
     const page=await this.client.call('GetCascadeTrajectoryGeneratorMetadata',{cascadeId:id,generatorMetadataOffset:offset,includeMessages:false});check();
     const items=page.generatorMetadata||page.generatorMetadatas||[];if(!Array.isArray(items))throw new Error('会话统计分页格式无效');
-    if(!items.length)break;append(generators,items);
+    if(!items.length)break;append(generators,items,nextGenSizes);
     const ids=items.map(item=>item?.id??item?.generatorId??item?.responseId??item?.chatModel?.responseId).filter(Boolean);
     if(ids.length===items.length){const fingerprint='page:'+JSON.stringify(ids);if(metadataPages.has(fingerprint))throw new Error('会话统计分页重复返回');metadataPages.add(fingerprint);}
    }
@@ -117,7 +129,7 @@ export class TrajectoryReader {
    if(generators.some(g=>(g.stepIndices||[]).some(i=>Number.isInteger(i)&&i>=steps.length)))throw new Error('会话仍在更新，请等待下一次刷新');
    const value={trajectory:{cascadeId:id,steps,generatorMetadata:generators},numTotalSteps:steps.length,numTotalGeneratorMetadata:generators.length,status:summary.status};
    assertCurrent();this.cachedBytes-=entry.bytes;entry.bytes=bytes;this.cachedBytes+=bytes;
-   entry.data=value;entry.summary=summary;entry.mark=mark;entry.verifiedAt=this.client.now();this.entries.delete(id);this.entries.set(id,entry);
+   entry.data=value;entry.summary=summary;entry.mark=mark;entry.stepSizes=nextStepSizes;entry.genSizes=nextGenSizes;entry.verifiedAt=this.client.now();this.entries.delete(id);this.entries.set(id,entry);
    this.failures.delete(id);this.trim(id);
    return value;
   })().catch(error=>{

@@ -205,11 +205,13 @@ export function isMostlyChinese(text) {
 
 export function stripThinkTagsAndQuotes(text) {
   let s = String(text || '');
-  s = s.replace(/<think>[\s\S]*?<\/think>/gi, '');
-  if (/<think>/i.test(s) && !/<\/think>/i.test(s)) {
-    s = s.replace(/<think>[\s\S]*$/i, '');
+  if (s.includes('<') && /<think|<\/?thought_source/i.test(s)) {
+    s = s.replace(/<think>[\s\S]*?<\/think>/gi, '');
+    if (/<think>/i.test(s) && !/<\/think>/i.test(s)) {
+      s = s.replace(/<think>[\s\S]*$/i, '');
+    }
+    s = s.replace(/<\/?thought_source>/gi, '');
   }
-  s = s.replace(/<\/?thought_source>/gi, '');
   return s.trim();
 }
 

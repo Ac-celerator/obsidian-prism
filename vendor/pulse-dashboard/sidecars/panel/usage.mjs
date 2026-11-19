@@ -99,8 +99,15 @@ async function readBounded(file,budget){
     return Buffer.concat(chunks,bytes).toString('utf8');
   }finally{await handle.close();}
 }
+const DATE_FMT_CACHE = new Map();
 export function dateKey(time,zone='Asia/Shanghai'){
-  const parts=new Intl.DateTimeFormat('en-CA',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(time);
+  let fmt=DATE_FMT_CACHE.get(zone);
+  if(!fmt){
+    fmt=new Intl.DateTimeFormat('en-CA',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit'});
+    if(DATE_FMT_CACHE.size>=32)DATE_FMT_CACHE.delete(DATE_FMT_CACHE.keys().next().value);
+    DATE_FMT_CACHE.set(zone,fmt);
+  }
+  const parts=fmt.formatToParts(time);
   const get=key=>parts.find(p=>p.type===key).value;return `${get('year')}-${get('month')}-${get('day')}`;
 }
 export function usageRecords(raw,conversationId,{maxRows=Infinity,maxBytes=Infinity}={}){

@@ -295,7 +295,14 @@ export class MetricsStore {
     if (entry?.pending) return entry.pending;
     if (!force && entry?.data && Date.now() - entry.updatedAt < 1800) return entry.data;
     entry ||= {};
+    this.sessions.delete(id);
     this.sessions.set(id, entry);
+    if (this.sessions.size > 128) {
+      for (const [oldId, oldEntry] of this.sessions) {
+        if (this.sessions.size <= 128) break;
+        if (oldId !== id && !oldEntry?.pending) this.sessions.delete(oldId);
+      }
+    }
     const current = () => this.owned() && identity === this.identity && epoch === this.epoch && this.sessions.get(id) === entry;
     entry.pending = (async () => {
       if (!entry.data) {

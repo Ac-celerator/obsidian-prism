@@ -321,6 +321,11 @@
   // 细粒度增量同步标记与脏节点队列
   const dirtyAddedRoots = new Set();
   const dirtyCollapsibleTargets = new Set();
+  const dirtyBgCmds = new Set();
+  let mainObserver = null;
+  let lastFormalConvEl = null;
+  let lastFormalCascadeId = '';
+  let lastStoreSnapKey = '';
   const dirtyFlags = {
     full: true,
     theme: false,
@@ -331,6 +336,7 @@
     overlays: false,
     collapsible: false,
     settings: false,
+    bgCmd: false,
   };
   const perfStats = {
     lastSyncMs: 0,
@@ -349,6 +355,7 @@
     dirtyFlags.overlays = true;
     dirtyFlags.collapsible = true;
     dirtyFlags.settings = true;
+    dirtyFlags.bgCmd = true;
   }
 
   function resolveWireSettingPair(key, value) {
@@ -672,6 +679,11 @@
     try {
       return fn();
     } finally {
+      if (!prev && mainObserver && typeof mainObserver.takeRecords === 'function') {
+        try {
+          mainObserver.takeRecords();
+        } catch {}
+      }
       internalDomMutating = prev;
     }
   }
@@ -807,7 +819,13 @@
     return { cascadeId, isRunning, isThinking, hasError };
   }
 
+  let crabRemoveAttrTimer = 0;
+
   function unmountCrab() {
+    if (crabRemoveAttrTimer) {
+      clearTimeout(crabRemoveAttrTimer);
+      crabRemoveAttrTimer = 0;
+    }
     if (mascotState.rig && typeof mascotState.rig.dispose === 'function') {
       try {
         mascotState.rig.dispose();
@@ -840,9 +858,20 @@
         mascotState.anchor = null;
       }
       if (document.documentElement?.hasAttribute('data-ag-cs-has-crab')) {
-        document.documentElement.removeAttribute('data-ag-cs-has-crab');
+        if (typeof setTimeout === 'function' && !destroyed) {
+          if (!crabRemoveAttrTimer) {
+            crabRemoveAttrTimer = setTimeout(() => {
+              crabRemoveAttrTimer = 0;
+              if (!destroyed && !mascotState.anchor) runGuardedMut(() => document.documentElement?.removeAttribute('data-ag-cs-has-crab'));
+            }, 220);
+          }
+        } else document.documentElement.removeAttribute('data-ag-cs-has-crab');
       }
       return;
+    }
+    if (crabRemoveAttrTimer) {
+      clearTimeout(crabRemoveAttrTimer);
+      crabRemoveAttrTimer = 0;
     }
     if (!mascotState.root) {
       const stage = document.createElement('div');
@@ -1113,6 +1142,98 @@
   let lastAppliedMotion = '';
   let lastAppliedTelemetry = '';
   let lastMetricsKey = '';
+  let lastAbsorbedSyncKey = '';
+  const MOTION_OFF_STYLE_ID = 'ag-prism-motion-off-css';
+
+  function flattenMainStyleSheet() {
+    const el = document.getElementById?.('ag-prism-css');
+    const rules = el?.sheet?.cssRules;
+    const key = el?.getAttribute?.('data-ag-cs-css-hash') || CODE_HASH || '1';
+    if (!rules?.length || el.getAttribute?.('data-ag-cs-flat') === key) return;
+    const splitC = (s) => {
+      const out = [];
+      for (let i = 0, d = 0, q = '', st = 0; i <= s.length; i++) {
+        const c = s[i];
+        if (c === '\\') { i++; continue; }
+        if (q) { if (c === q) q = ''; continue; }
+        if (c === '"' || c === "'") q = c;
+        else if (c === '(' || c === '[') d++;
+        else if (c === ')' || c === ']') d--;
+        else if ((!c || (c === ',' && !d)) && i >= st) { const t = s.slice(st, i).trim(); if (t) out.push(t); st = i + 1; }
+      }
+      return out;
+    };
+    const expIs = (s) => {
+      let q = '', br = 0, nd = 0, idx = -1;
+      const stk = [];
+      for (let i = 0; i < s.length; i++) {
+        const c = s[i];
+        if (c === '\\') { i++; continue; }
+        if (q) { if (c === q) q = ''; continue; }
+        if (c === '"' || c === "'") q = c;
+        else if (c === '[') br++;
+        else if (c === ']') br && br--;
+        else if (!br) {
+          if (c === '(') { const n = s.slice(i - 4, i) === ':not'; if (n) nd++; stk.push(n); }
+          else if (c === ')') { if (stk.pop()) nd--; }
+          else if (!nd && c === ':' && s.slice(i, i + 4) === ':is(') { idx = i; break; }
+        }
+      }
+      if (idx < 0) return [s];
+      let d = 0, end = -1;
+      for (let i = idx + 3; i < s.length; i++) {
+        const c = s[i];
+        if (c === '\\') { i++; continue; }
+        if (q) { if (c === q) q = ''; continue; }
+        if (c === '"' || c === "'") q = c;
+        else if (c === '(') d++;
+        else if (c === ')' && !--d) { end = i; break; }
+      }
+      if (end < 0) return [s];
+      const parts = splitC(s.slice(idx + 4, end));
+      if (!parts.length || parts.length > 40 || (parts.length === 1 && /[\s>+~]/.test(parts[0]))) return [s];
+      const pre = s.slice(0, idx), post = s.slice(end + 1), res = [];
+      for (const p of parts) {
+        for (const sub of expIs(pre + p + post)) if (res.push(sub) > 200) return [s];
+      }
+      return res;
+    };
+    const expSel = (s) => splitC(s).flatMap(expIs).join(',');
+    const walk = (rs, ps) => {
+      const out = [];
+      for (const r of rs) {
+        if (r.type === 1) {
+          let sel = r.selectorText;
+          if (ps) sel = splitC(ps).flatMap((p) => splitC(sel).map((c) => {
+            const fi = c.indexOf('&');
+            return fi < 0 ? p + ' ' + c : fi === 0 && c.indexOf('&', 1) < 0 ? p + c.slice(1) : c.replace(/&/g, ':is(' + p + ')');
+          })).join(',');
+          if (r.style?.cssText) out.push(expSel(sel) + '{' + r.style.cssText + '}');
+          if (r.cssRules?.length) out.push(...walk(r.cssRules, sel));
+        } else if (r.type === 4 || r.type === 12) {
+          const inner = walk(r.cssRules || [], ps);
+          if (inner.length) out.push((r.type === 4 ? '@media ' : '@supports ') + r.conditionText + '{' + inner.join('\n') + '}');
+        } else if (!r.selectorText && r.style?.cssText && ps) out.push(expSel(ps) + '{' + r.style.cssText + '}');
+        else if (r.cssText) out.push(r.cssText);
+      }
+      return out;
+    };
+    try {
+      const flat = walk(rules, '').join('\n');
+      if (flat) runGuardedMut(() => { el.textContent = flat; el.setAttribute?.('data-ag-cs-flat', key); });
+    } catch {}
+  }
+
+  function syncMotionOffStyle(isOff) {
+    const el = document.getElementById?.(MOTION_OFF_STYLE_ID);
+    if (!isOff) return el?.remove?.();
+    if (!el && typeof document.createElement === 'function') {
+      const s = document.createElement('style');
+      s.id = MOTION_OFF_STYLE_ID;
+      s.textContent = 'html[data-ag-cs-style][data-ag-cs-motion="off"]{&,& *,& *::before,& *::after{animation:none!important;transition:none!important}}';
+      (document.head || document.documentElement)?.appendChild?.(s);
+    }
+  }
 
   function refreshOpenUiForLanguage() {
     const inHero = Boolean(document.querySelector('.agy-home [data-testid="home-greeting"]'));
@@ -1153,28 +1274,40 @@
     } catch {}
   }
 
-  function syncAbsorbedModules() {
+  function syncAbsorbedModules(force = false) {
+    const tel = window.__agPrismTelemetry;
+    const eff = window.__agPrismEffortSlider;
+    const th = window.__agPrismThought;
+    const omni = window.__agPrismOmni;
+    const meta = window.__agPrismOmniServerMeta || null;
+    const key = [
+      VERSION,
+      getLang(),
+      getTelemetryMode(),
+      getEffortSliderMode(),
+      getThoughtTranslateMode(),
+      getThoughtTriggerTiming(),
+      getThoughtView(),
+      getOmniMode(),
+      getLinkTarget(),
+      meta?.baseUrl || '',
+      tel ? 1 : 0,
+      eff ? 1 : 0,
+      th ? 1 : 0,
+      omni ? 1 : 0,
+    ].join('|');
+    if (!force && key === lastAbsorbedSyncKey) return;
+    lastAbsorbedSyncKey = key;
+    try { tel?.sync?.(cfg); } catch {}
+    try { eff?.sync?.(cfg); } catch {}
+    try { th?.sync?.(cfg); } catch {}
     try {
-      window.__agPrismTelemetry?.sync?.(cfg);
+      if (getOmniMode() === 'off') omni?.destroy?.();
+      else omni?.sync?.(cfg, meta);
     } catch {}
-    try {
-      window.__agPrismEffortSlider?.sync?.(cfg);
-    } catch {}
-    try {
-      window.__agPrismThought?.sync?.(cfg);
-    } catch {}
-    if (getOmniMode() === 'off') {
-      try {
-        window.__agPrismOmni?.destroy?.();
-      } catch {}
-    } else {
-      try {
-        window.__agPrismOmni?.sync?.(cfg, window.__agPrismOmniServerMeta || null);
-      } catch {}
-    }
   }
 
-  function applyRootAttrs() {
+  function applyRootAttrs(forceAbsorbed = false) {
     const html = document.documentElement;
     if (!html) return;
     const palette = getEffectivePalette();
@@ -1225,7 +1358,8 @@
       if (isCjk) setAttrIfChanged(html, 'data-ag-cs-cjk', '1');
       else if (html.hasAttribute('data-ag-cs-cjk')) html.removeAttribute('data-ag-cs-cjk');
 
-      syncAbsorbedModules();
+      syncMotionOffStyle(motionLv === 'off');
+      syncAbsorbedModules(forceAbsorbed);
       setAttrIfChanged(html, 'data-ag-prism-thought-view', getThoughtView());
       setAttrIfChanged(html, 'data-ag-prism-omni', getOmniMode());
       setAttrIfChanged(html, 'data-ag-prism-link-target', getLinkTarget());
@@ -1421,6 +1555,8 @@
 
     for (const card of cards) {
       const inputBox = card.closest('[data-testid="agent-input-box"]');
+      const zLayer = inputBox?.closest?.('.z-10');
+      if (zLayer) setAttrIfChanged(zLayer, 'data-ag-cs-input-layer', '1');
       const isPrimary = card === primaryCard;
 
       if (isPrimary && cfg.composerRestyle !== false) {
@@ -1891,7 +2027,7 @@
   const OWN_PLUGIN_SELECTOR =
     '.ag-cs-home-panel-seat, .ag-cs-ripple-host, .ag-cs-conv-aura-host, .ag-cs-crab, .ag-cs-prism-rim-cv, .ag-cs-model-glyph, [data-testid="orchestrator-effort-bar"], .ag-cs-thinking-spark, .ag-cs-smooth-caret, .ag-cs-liftoff-veil, .ag-cs-sidebar-glide-pill, .ag-cs-pill-glide, .ag-cs-stream-chunk, .ag-cs-thought-chunk, .ag-anim-icon, .ag-prism-omni-menu, .ag-prism-omni-pane, [data-ag-prism-omni-owned="1"], #ag-pulse-status-bar, #context-card, #' +
     SETTINGS_SEC_ID +
-    ', #ag-prism-css, #ag-prism-omni-css, #ag-claude-style-css';
+    ', #ag-prism-css, #ag-prism-omni-css, #ag-claude-style-css, #ag-prism-motion-off-css';
 
   function isOwnPluginNode(target) {
     if (!target) return false;
@@ -1923,6 +2059,30 @@
     'SPAN', 'P', 'CODE', 'STRONG', 'EM', 'B', 'I', 'LI', 'TD', 'TH', 'TR', 'BR', 'HR', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
   ]);
 
+  function syncBgCmdWrapParent(p) {
+    if (!p || p.isConnected === false || String(p.tagName || '').toUpperCase() !== 'DIV') return;
+    const has = Array.from(p.children || []).some((c) => c?.getAttribute?.('data-testid') === 'background-task-command');
+    if (has) setAttrIfChanged(p, 'data-ag-cs-bg-cmd-wrap', '1');
+    else if (p.hasAttribute?.('data-ag-cs-bg-cmd-wrap')) p.removeAttribute('data-ag-cs-bg-cmd-wrap');
+  }
+
+  function stampBgCmdWrap(scopeOrList) {
+    const items = Array.isArray(scopeOrList) ? scopeOrList : [scopeOrList || document];
+    for (const el of items) {
+      if (!el || el.isConnected === false) continue;
+      if (el.getAttribute?.('data-testid') === 'background-task-command') {
+        syncBgCmdWrapParent(el.parentElement);
+        continue;
+      }
+      if (el.hasAttribute?.('data-ag-cs-bg-cmd-wrap')) syncBgCmdWrapParent(el);
+      if (typeof el.querySelectorAll !== 'function') continue;
+      if (!Array.isArray(scopeOrList)) {
+        for (const w of el.querySelectorAll('[data-ag-cs-bg-cmd-wrap="1"]')) syncBgCmdWrapParent(w);
+      }
+      for (const c of el.querySelectorAll('[data-testid="background-task-command"]')) syncBgCmdWrapParent(c.parentElement);
+    }
+  }
+
   function classifyDirtySubtree(el, isAdded) {
     if (!isElementLike(el)) return;
     const tid = String(el.getAttribute?.('data-testid') || '');
@@ -1941,6 +2101,24 @@
       return;
     }
 
+    const HC_ATTR = 'data-hover-card-popup';
+    if (
+      el.hasAttribute?.(HC_ATTR) ||
+      el.closest?.('[' + HC_ATTR + ']') ||
+      (role === 'presentation' && el.firstElementChild?.hasAttribute?.(HC_ATTR))
+    ) {
+      return;
+    }
+
+    if (tid === 'background-task-command') {
+      if (isAdded) {
+        dirtyFlags.bgCmd = true;
+        dirtyBgCmds.add(el);
+      }
+      return;
+    }
+
+    let touchedButtons = false;
     const inConvStream =
       tid !== 'conversation-view' &&
       tid !== 'agent-input-box' &&
@@ -1958,14 +2136,13 @@
       ) {
         dirtyFlags.route = true;
         dirtyFlags.composer = true;
-        dirtyFlags.buttons = true;
+        touchedButtons = true;
         dirtyFlags.collapsible = true;
-        if (!isAdded) dirtyFlags.full = true;
       }
 
       if (tid === 'conversation-row-sidebar' || el.closest?.('aside') || el.querySelector?.('[data-testid="conversation-row-sidebar"]')) {
         dirtyFlags.sidebar = true;
-        if (isAdded) dirtyFlags.buttons = true;
+        if (isAdded) touchedButtons = true;
       }
 
       if (
@@ -1986,24 +2163,29 @@
       ) {
         dirtyFlags.composer = true;
         dirtyFlags.route = true;
-        if (isAdded) dirtyFlags.buttons = true;
+        if (isAdded) touchedButtons = true;
       }
 
       if (
         role === 'dialog' ||
         tid === 'model-selector-panel' ||
-        tid === 'overview-panel' ||
-        cls.includes('agy-overlay') ||
         el.id === 'ag-pulse-status-bar' ||
         el.id === 'ag-prism-pulse-bar' ||
         el.id === 'context-card' ||
         el.closest?.('[role="dialog"], [data-testid="model-selector-panel"]') ||
-        el.querySelector?.('[role="dialog"], [data-testid="model-selector-panel"], .agy-overlay, #context-card')
+        el.querySelector?.('[role="dialog"], [data-testid="model-selector-panel"], #context-card')
       ) {
         dirtyFlags.overlays = true;
         dirtyFlags.settings = true;
         dirtyFlags.composer = true;
-        if (isAdded) dirtyFlags.buttons = true;
+        if (isAdded) touchedButtons = true;
+      } else if (
+        tid === 'overview-panel' ||
+        cls.includes('agy-overlay') ||
+        Boolean(el.querySelector?.('[data-testid="overview-panel"]')) ||
+        Boolean(el.querySelector?.('.agy-overlay') && !el.querySelector?.('[' + HC_ATTR + ']'))
+      ) {
+        dirtyFlags.overlays = true;
       }
     } else {
       if (
@@ -2018,6 +2200,14 @@
       if (role === 'dialog' || tid === 'overview-panel' || cls.includes('agy-overlay')) {
         dirtyFlags.overlays = true;
       }
+    }
+
+    if (
+      isAdded &&
+      el.querySelector?.('[data-testid="background-task-command"]')
+    ) {
+      dirtyFlags.bgCmd = true;
+      dirtyBgCmds.add(el);
     }
 
     if (
@@ -2036,7 +2226,10 @@
       if (isAdded) dirtyCollapsibleTargets.add(el);
     }
 
-    if (isAdded && (isHostButtonCandidate(el) || el.querySelector?.(HOST_BTN_QUERY))) {
+    if (isAdded && (touchedButtons || isHostButtonCandidate(el) || el.querySelector?.(HOST_BTN_QUERY))) {
+      dirtyFlags.buttons = true;
+      dirtyAddedRoots.add(el);
+    } else if (touchedButtons) {
       dirtyFlags.buttons = true;
     }
   }
@@ -2045,7 +2238,14 @@
     const inHome = Boolean(document.querySelector('.agy-home'));
     const inHero = inHome && Boolean(document.querySelector('.agy-home [data-testid="home-greeting"]'));
     const formalConv = !inHome ? streamChoreoCtl.findFormalConvView() : null;
-    const isAsyncConvEntry = !isFullSync && !inHome && Boolean(formalConv) && !streamChoreoCtl.heroState.wasInFormalConv;
+    const curCascadeId = formalConv ? formalConv.getAttribute?.('data-cascade-id') || resolveCascadeId(null) || '' : '';
+    const isConvSwap = Boolean(
+      formalConv &&
+        ((lastFormalConvEl && formalConv !== lastFormalConvEl) ||
+          (curCascadeId && lastFormalCascadeId && curCascadeId !== lastFormalCascadeId))
+    );
+    const isAsyncConvEntry =
+      !isFullSync && !inHome && Boolean(formalConv) && (!streamChoreoCtl.heroState.wasInFormalConv || isConvSwap);
 
     let homeComposerSampled = false;
     if (inHome && (flags.full || flags.route || flags.composer)) {
@@ -2071,11 +2271,16 @@
       !isAsyncConvEntry && (flags.full || flags.composer) && cfg.smoothCaret !== false
         ? smoothCaretCtl.measureSnapshot(false, false)
         : null;
+    if (flags.full || flags.route || flags.composer || flags.theme) {
+      convAuraCtl.prime?.();
+    }
 
     return {
       inHome,
       inHero,
       formalConv,
+      curCascadeId,
+      isConvSwap,
       isAsyncConvEntry,
       homeComposerSampled,
       convInputRect,
@@ -2122,8 +2327,10 @@
     const flags = { ...dirtyFlags };
     const addedRoots = Array.from(dirtyAddedRoots);
     const collapsibleScope = dirtyCollapsibleTargets.size > 0 ? new Set(dirtyCollapsibleTargets) : null;
+    const bgCmdNodes = dirtyBgCmds.size > 0 ? Array.from(dirtyBgCmds) : null;
     dirtyAddedRoots.clear();
     dirtyCollapsibleTargets.clear();
+    dirtyBgCmds.clear();
     dirtyFlags.full = false;
     dirtyFlags.theme = false;
     dirtyFlags.route = false;
@@ -2133,17 +2340,38 @@
     dirtyFlags.overlays = false;
     dirtyFlags.collapsible = false;
     dirtyFlags.settings = false;
+    dirtyFlags.bgCmd = false;
 
     const prevWasInHome = streamChoreoCtl.heroState.wasInHome;
     const prevWasInConv = streamChoreoCtl.heroState.wasInFormalConv;
+    const effectiveFull = Boolean(forceFull || flags.full);
 
     // ── Phase 1: Pure Measure ──
-    const measured = measureSyncPhase(flags, forceFull);
+    const measured = measureSyncPhase(flags, effectiveFull);
     const deferHeavyConvWork = Boolean(measured.isAsyncConvEntry);
+    if (measured.inHome) {
+      lastFormalConvEl = null;
+      lastFormalCascadeId = '';
+    } else if (measured.formalConv) {
+      lastFormalConvEl = measured.formalConv;
+      if (measured.curCascadeId) lastFormalCascadeId = measured.curCascadeId;
+    }
+    if (measured.isConvSwap || (measured.inHome && prevWasInConv)) {
+      streamChoreoCtl.cancelDeferredHydration();
+    }
+
+    const routeJumped =
+      effectiveFull ||
+      measured.isConvSwap ||
+      measured.inHome !== prevWasInHome ||
+      Boolean(measured.formalConv) !== prevWasInConv;
 
     // ── Phase 2: Pure Mutate ──
     runGuardedMut(() => {
-      applyRootAttrs();
+      applyRootAttrs(effectiveFull);
+      if (effectiveFull || flags.bgCmd) {
+        stampBgCmdWrap(effectiveFull ? document : bgCmdNodes);
+      }
 
       if (flags.full || flags.route || measured.inHero !== homeStudioCtl.wasHero()) {
         homeStudioCtl.syncGreeting(measured.inHero);
@@ -2160,7 +2388,7 @@
         rippleCtl.sync();
       }
       if (flags.full || flags.route || flags.composer || flags.collapsible || flags.theme) {
-        convAuraCtl.sync();
+        convAuraCtl.sync(true);
       }
       if (flags.full || flags.composer || flags.overlays || flags.collapsible) {
         syncComposers(measured, deferHeavyConvWork);
@@ -2177,35 +2405,58 @@
         streamChoreoCtl.syncLensOverlayOrigins(measured.lensOverlays);
       }
 
-      const routeJumped =
-        flags.full ||
-        measured.inHome !== prevWasInHome ||
-        Boolean(measured.formalConv) !== prevWasInConv;
-      if (routeJumped || flags.route || flags.composer || flags.overlays || flags.collapsible) {
+      if (routeJumped || flags.route || flags.composer) {
         prismRimCtl.markDirty();
       }
 
       if (deferHeavyConvWork) {
-        streamChoreoCtl.scheduleDeferredConvEntry(() => {
+        const outerAddedRoots = addedRoots.filter(
+          (r) => r && r.isConnected !== false && (!measured.formalConv || !measured.formalConv.contains?.(r))
+        );
+        if (outerAddedRoots.length > 0) syncHostAnimatedIcons(outerAddedRoots);
+        const expectedConv = measured.formalConv;
+        const expectedCid = measured.curCascadeId || '';
+        const verifyTargetConv = () => {
+          if (destroyed) return null;
           const convNow = streamChoreoCtl.findFormalConvView();
-          if (!convNow) return;
-          runGuardedMut(() => {
-            streamChoreoCtl.syncThinkingSparks(latestPrimaryModelInfo);
-            streamChoreoCtl.syncDualStreamEngine();
-            syncHostAnimatedIcons([convNow]);
-            streamChoreoCtl.syncWorkedForAutoUnfold();
-            streamChoreoCtl.syncHeroCCaustics();
-            try {
-              hostEnhancerCtl.sync?.();
-            } catch {}
-          });
-          if (getThoughtTranslateMode() !== 'off') {
-            try {
-              window.__agPrismThought?.scan?.();
-            } catch {}
+          if (!convNow) return null;
+          const nowCid = convNow.getAttribute?.('data-cascade-id') || resolveCascadeId(null) || '';
+          if (convNow !== expectedConv || (expectedCid && nowCid && nowCid !== expectedCid)) {
+            dirtyFlags.route = true;
+            scheduleSync();
+            return null;
           }
-          smoothCaretCtl.queue(false, false, true);
-        }, 65);
+          return convNow;
+        };
+        streamChoreoCtl.scheduleDeferredConvEntry(
+          () => {
+            const convNow = verifyTargetConv();
+            if (!convNow) return false;
+            runGuardedMut(() => {
+              stampBgCmdWrap(convNow);
+              streamChoreoCtl.syncThinkingSparks(latestPrimaryModelInfo);
+              streamChoreoCtl.syncDualStreamEngine();
+              streamChoreoCtl.syncHeroCCaustics();
+            });
+            scheduleHostEnhancerSync(false);
+            smoothCaretCtl.queue(false, false, false);
+            return true;
+          },
+          140,
+          () => {
+            const convNow = verifyTargetConv();
+            if (!convNow) return;
+            runGuardedMut(() => {
+              syncHostAnimatedIcons([convNow]);
+            });
+            streamChoreoCtl.syncWorkedForAutoUnfold();
+            if (getThoughtTranslateMode() !== 'off') {
+              try {
+                window.__agPrismThought?.scan?.();
+              } catch {}
+            }
+          }
+        );
       } else {
         if (flags.full) {
           syncHostAnimatedIcons(null);
@@ -2216,63 +2467,67 @@
           syncHostAnimatedIcons(addedRoots);
         }
 
-        if (flags.full || routeJumped) {
-          streamChoreoCtl.syncWorkedForAutoUnfold();
-        } else if (flags.collapsible) {
-          streamChoreoCtl.syncWorkedForAutoUnfold(collapsibleScope);
-        }
-
         if ((flags.full || flags.collapsible || routeJumped) && getThoughtTranslateMode() !== 'off') {
           try {
             window.__agPrismThought?.scan?.();
           } catch {}
         }
       }
-      if (flags.full || flags.settings || flags.overlays) {
+      if (flags.full || flags.settings) {
         ensureSettingsSection();
       }
-      if (flags.full || flags.route || flags.composer || flags.overlays || flags.theme) {
+      if (flags.full || flags.route || flags.composer || flags.theme) {
         if (flags.full || routeJumped || flags.theme) {
           try {
             window.__agPrismTelemetry?.sync?.(cfg);
           } catch {}
         }
-        ensurePulseBridge(Boolean(flags.full || flags.theme || flags.overlays));
+        ensurePulseBridge(Boolean(flags.full || flags.theme));
       }
       if (
-        flags.full ||
-        flags.route ||
-        flags.collapsible ||
-        flags.composer ||
-        flags.buttons ||
-        flags.overlays ||
-        flags.theme
+        !deferHeavyConvWork &&
+        (flags.full ||
+          flags.route ||
+          flags.collapsible ||
+          flags.composer ||
+          flags.buttons ||
+          flags.theme)
       ) {
         scheduleHostEnhancerSync(Boolean(flags.full || routeJumped || flags.theme));
       }
     });
+    if (!deferHeavyConvWork) {
+      if (flags.full || routeJumped) {
+        streamChoreoCtl.syncWorkedForAutoUnfold();
+      } else if (flags.collapsible) {
+        streamChoreoCtl.syncWorkedForAutoUnfold(collapsibleScope);
+      }
+    }
 
     perfStats.lastSyncMs = +(performance.now() - t0).toFixed(3);
     perfStats.syncCount += 1;
   }
 
   function scheduleSync() {
-    if (destroyed || syncQueued) return;
-    syncQueued = true;
-    if (!document.hidden && typeof requestAnimationFrame === 'function') {
-      syncIsRaf = true;
-      syncTimer = requestAnimationFrame(() => {
+    if (destroyed) return;
+    const highPri = Boolean(
+      dirtyFlags.full || dirtyFlags.route || dirtyFlags.theme || dirtyFlags.sidebar || dirtyFlags.composer || dirtyFlags.overlays || dirtyFlags.settings
+    );
+    if (syncQueued) {
+      if (highPri && !syncIsRaf && !document.hidden && syncTimer) {
+        clearTimeout(syncTimer);
         syncTimer = null;
         syncQueued = false;
-        runSync(false);
-      });
+      } else return;
+    }
+    syncQueued = true;
+    const run = () => { syncTimer = null; syncQueued = false; runSync(false); };
+    if (!document.hidden && (highPri || !isConvRunning()) && typeof requestAnimationFrame === 'function') {
+      syncIsRaf = true;
+      syncTimer = requestAnimationFrame(run);
     } else {
       syncIsRaf = false;
-      syncTimer = setTimeout(() => {
-        syncTimer = null;
-        syncQueued = false;
-        runSync(false);
-      }, 50);
+      syncTimer = setTimeout(run, document.hidden ? 50 : 96);
     }
   }
 
@@ -2284,6 +2539,27 @@
     if (document.hidden) {
       pendingHiddenFullSync = true;
       return;
+    }
+    const st = cachedStore?.getState?.();
+    if (st) {
+      const cs = st.conversation?.convoState;
+      const cid = cs?.type === 'active' ? cs.cascadeId || '' : cs?.type === 'subagent' ? cs.childConversationId || '' : '';
+      const entry = cid
+        ? st.trajectorySummaries?.summaries?.[cid] ?? st.cascadeTrajectorySummaries?.[cid] ?? null
+        : null;
+      const sum = entry?.summary || entry || {};
+      const snapKey = [
+        location.pathname || '',
+        cs?.type || '',
+        cid,
+        sum.status ?? '',
+        sum.notFullyIdle ? 1 : 0,
+        sum.hasError ? 1 : 0,
+        sum.hasRunningSubagents ? 1 : 0,
+        st.userStatus?.name || '',
+      ].join('|');
+      if (snapKey === lastStoreSnapKey) return;
+      lastStoreSnapKey = snapKey;
     }
     dirtyFlags.composer = true;
     dirtyFlags.route = true;
@@ -2543,10 +2819,18 @@
           continue;
         }
         const tid = String(tgt?.getAttribute?.('data-testid') || '');
-        if (tid === 'conversation-row-sidebar') {
+        if (tid === 'conversation-view' && m.attributeName === 'data-cascade-id') {
+          dirtyFlags.route = true;
+          dirtyFlags.composer = true;
+          anyRelevant = true;
+        } else if (tid === 'conversation-row-sidebar') {
           dirtyFlags.sidebar = true;
           anyRelevant = true;
-        } else if (tid === 'worked-for-collapsible' || tid === 'thinking-collapsible-trigger') {
+        } else if (
+          tid === 'worked-for-collapsible' ||
+          tid === 'thinking-collapsible-trigger' ||
+          tid === 'changed-files-card-header'
+        ) {
           dirtyFlags.collapsible = true;
           dirtyCollapsibleTargets.add(tgt);
           anyRelevant = true;
@@ -2564,7 +2848,6 @@
           for (let j = 0; j < added.length; j++) {
             const node = added[j];
             if (!isElementLike(node) || isThoughtIsolatedNode(node) || isOwnPluginNode(node)) continue;
-            dirtyAddedRoots.add(node);
             classifyDirtySubtree(node, true);
             if (inComposerBox) {
               dirtyFlags.composer = true;
@@ -2575,6 +2858,11 @@
         }
         const removed = m.removedNodes;
         if (removed && removed.length > 0) {
+          if (isElementLike(m.target) && m.target.hasAttribute?.('data-ag-cs-bg-cmd-wrap')) {
+            dirtyFlags.bgCmd = true;
+            dirtyBgCmds.add(m.target);
+            anyRelevant = true;
+          }
           for (let j = 0; j < removed.length; j++) {
             const node = removed[j];
             if (!isElementLike(node) || isThoughtIsolatedNode(node) || isOwnPluginNode(node)) continue;
@@ -2600,11 +2888,12 @@
         dirtyFlags.overlays ||
         dirtyFlags.collapsible ||
         dirtyFlags.settings ||
-        dirtyAddedRoots.size > 0)
+        dirtyFlags.bgCmd)
     ) {
       scheduleSync();
     }
   });
+  mainObserver = observer;
 
   // Strict test contract: NEVER register 'click' or 'mousedown' on document!
   const DOC_LISTENERS = [
@@ -2640,6 +2929,12 @@
     streamChoreoCtl.clearTransientTimers();
     dirtyAddedRoots.clear();
     dirtyCollapsibleTargets.clear();
+    dirtyBgCmds.clear();
+    if (crabRemoveAttrTimer) {
+      clearTimeout(crabRemoveAttrTimer);
+      crabRemoveAttrTimer = 0;
+    }
+    syncMotionOffStyle(false);
     streamChoreoCtl.disconnectStreamObserver();
     if (pollTimer !== null) {
       clearInterval(pollTimer);
@@ -2728,11 +3023,12 @@
   function startLifecycle() {
     if (destroyed || lifecycleStarted || !document.documentElement) return;
     lifecycleStarted = true;
+    flattenMainStyleSheet();
     observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['class', 'aria-expanded', 'data-selected'],
+      attributeFilter: ['class', 'aria-expanded', 'data-selected', 'data-cascade-id'],
     });
     for (const [evName, handler] of DOC_LISTENERS) {
       document.addEventListener(evName, handler, true);
@@ -2764,6 +3060,7 @@
     version: VERSION,
     legacyApiVersion: LEGACY_API_VERSION,
     codeHash: CODE_HASH,
+    flattenCss: flattenMainStyleSheet,
     saveSettingsBatch,
     refreshConfig(next) {
       if (next && typeof next === 'object') {
@@ -2782,12 +3079,16 @@
       }
       if (lifecycleStarted && !destroyed) restartPollTimer();
       markAllDirty();
-      applyRootAttrs();
+      lastAbsorbedSyncKey = '';
+      applyRootAttrs(true);
       runSync(true);
       return true;
     },
     sync() {
-      if (!destroyed) runSync(true);
+      if (!destroyed) {
+        lastAbsorbedSyncKey = '';
+        runSync(true);
+      }
     },
     getState() {
       const convAura = convAuraCtl.getInstance();
@@ -2909,12 +3210,17 @@
         'data-ag-cs-spark-streaming',
         'data-ag-cs-prism-cv',
         'data-ag-cs-code-folded',
+        'data-ag-cs-bg-cmd-wrap',
+        'data-ag-cs-input-layer',
+        'data-ag-cs-hdr-open',
+        'data-ag-cs-rich-pre',
+        'data-ag-cs-glide-item',
       ]) {
         document.querySelectorAll(`[${attr}]`).forEach((el) => el.removeAttribute(attr));
       }
       document
         .querySelectorAll(
-          '#ag-prism-settings-v101-css, #ag-prism-omni-css, .ag-omni-dock, .ag-omni-menu, .ag-prism-omni-menu, .ag-prism-omni-pane, [data-ag-prism-omni-owned="1"], .ag-cs-liftoff-veil, .ag-cs-sidebar-glide-pill, .ag-cs-pill-glide, .ag-cs-conv-aura-host, .ag-cs-conv-glow, .ag-cs-prism-rim-cv, .ag-cs-code-fold-btn, .ag-cs-nav-outline-popover, .ag-cs-model-glyph, .ag-cs-panel-row-glyph, [data-testid="orchestrator-effort-bar"], .ag-cs-thinking-spark, .ag-cs-orbital-backdrop, .ag-cs-perf-backdrop, #' +
+          '#ag-prism-settings-v101-css, #ag-prism-omni-css, #ag-prism-motion-off-css, .ag-omni-dock, .ag-omni-menu, .ag-prism-omni-menu, .ag-prism-omni-pane, [data-ag-prism-omni-owned="1"], .ag-cs-liftoff-veil, .ag-cs-sidebar-glide-pill, .ag-cs-pill-glide, .ag-cs-conv-aura-host, .ag-cs-conv-glow, .ag-cs-prism-rim-cv, .ag-cs-code-fold-btn, .ag-cs-nav-outline-popover, .ag-cs-model-glyph, .ag-cs-panel-row-glyph, [data-testid="orchestrator-effort-bar"], .ag-cs-thinking-spark, .ag-cs-orbital-backdrop, .ag-cs-perf-backdrop, #' +
             SETTINGS_SEC_ID
         )
         .forEach((el) => el.remove());

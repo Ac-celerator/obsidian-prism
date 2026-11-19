@@ -1050,7 +1050,8 @@ export class PrismDaemon {
               if (!refreshedFast && !entry.session.closed) {
                 await entry.session.evaluate(injectSnap).catch(() => {});
               }
-              if (omniSnap && !skippedStale && !entry.session.closed) {
+              const omniChanged = Boolean(omniSnap && (entry.lastOmniExpr !== omniSnap || !entry.omniScriptId));
+              if (omniSnap && !skippedStale && !entry.session.closed && (!refreshedFast || omniChanged)) {
                 await entry.session.evaluate(omniSnap).catch(() => {});
               }
 
@@ -1070,18 +1071,27 @@ export class PrismDaemon {
               if (addRes && addRes.identifier) {
                 entry.scriptId = addRes.identifier;
               }
-              if (entry.omniScriptId) {
-                await entry.session
-                  .send('Page.removeScriptToEvaluateOnNewDocument', { identifier: entry.omniScriptId })
-                  .catch(() => {});
-                entry.omniScriptId = null;
-              }
-              if (omniSnap && !entry.session.closed) {
+              if (!omniSnap) {
+                if (entry.omniScriptId) {
+                  await entry.session
+                    .send('Page.removeScriptToEvaluateOnNewDocument', { identifier: entry.omniScriptId })
+                    .catch(() => {});
+                  entry.omniScriptId = null;
+                }
+                entry.lastOmniExpr = '';
+              } else if (omniChanged && !entry.session.closed) {
+                if (entry.omniScriptId) {
+                  await entry.session
+                    .send('Page.removeScriptToEvaluateOnNewDocument', { identifier: entry.omniScriptId })
+                    .catch(() => {});
+                  entry.omniScriptId = null;
+                }
                 const omniAdd = await entry.session
                   .send('Page.addScriptToEvaluateOnNewDocument', { source: omniSnap })
                   .catch(() => null);
                 if (omniAdd && omniAdd.identifier) {
                   entry.omniScriptId = omniAdd.identifier;
+                  entry.lastOmniExpr = omniSnap;
                 }
               }
             })
@@ -1196,9 +1206,16 @@ export class PrismDaemon {
           .catch(() => null);
         if (omniAdd && omniAdd.identifier) {
           entry.omniScriptId = omniAdd.identifier;
+          entry.lastOmniExpr = this.omniExpr;
         }
         await entry.session.evaluate(this.omniExpr).catch(() => null);
+      } else {
+        entry.lastOmniExpr = '';
       }
+      entry.lastVerifyAt = Date.now();
+      entry.healthyStreak = 1;
+      entry.verifyDirty = false;
+      entry.lastVerifiedCodeHash = this.codeHash || '';
       return mainRes;
     });
   }
@@ -1329,6 +1346,41 @@ export class PrismDaemon {
         } else if (action === 'test-connection') {
           result = await svc.testConnection(input);
         } else if (action === 'translate-stream') {
+          let lastSent = '';
+          let pendingPartial = null;
+          let sendingPartial = false;
+          const flushPartial = async () => {
+            if (sendingPartial) return;
+            sendingPartial = true;
+            try {
+              while (pendingPartial !== null) {
+                if (!entry || entry.session.closed) {
+                  pendingPartial = null;
+                  break;
+                }
+                const target = pendingPartial;
+                pendingPartial = null;
+                if (target === lastSent) continue;
+                const payload =
+                  lastSent.length > 0 && target.startsWith(lastSent)
+                    ? { a: target.slice(lastSent.length), o: lastSent.length }
+                    : target;
+                const safeId = Number(reqId) | 0;
+                const chunkExpr = `window.__agPrismThoughtOnChunk && window.__agPrismThoughtOnChunk(${safeId}, ${serializeJsonForEval(payload)})`;
+                const chunkParams = { expression: chunkExpr, returnByValue: true };
+                if (executionContextId) chunkParams.contextId = executionContextId;
+                try {
+                  await entry.session.send('Runtime.evaluate', chunkParams);
+                  lastSent = target;
+                } catch {
+                  // Delivery failed: reset cursor so the next chunk resyncs cleanly via full-string reset frame
+                  lastSent = '';
+                }
+              }
+            } finally {
+              sendingPartial = false;
+            }
+          };
           result = await svc.translateThought({
             text: input.text || '',
             mode: input.mode || 'ai',
@@ -1338,11 +1390,8 @@ export class PrismDaemon {
             bypassCache: Boolean(input.bypassCache),
             onPartial: (partialText) => {
               if (!entry || entry.session.closed) return;
-              const safeId = Number(reqId) | 0;
-              const chunkExpr = `window.__agPrismThoughtOnChunk && window.__agPrismThoughtOnChunk(${safeId}, ${serializeJsonForEval(partialText)})`;
-              const chunkParams = { expression: chunkExpr, returnByValue: true };
-              if (executionContextId) chunkParams.contextId = executionContextId;
-              void entry.session.send('Runtime.evaluate', chunkParams).catch(() => {});
+              pendingPartial = String(partialText || '');
+              void flushPartial();
             },
           });
         } else {
@@ -1442,6 +1491,11 @@ export class PrismDaemon {
       session,
       scriptId: null,
       omniScriptId: null,
+      lastOmniExpr: '',
+      lastVerifyAt: 0,
+      healthyStreak: 0,
+      verifyDirty: true,
+      lastVerifiedCodeHash: '',
       mainFrameId: null,
       hasFrameTree: false,
       contextFrames: new Map(),
@@ -1482,6 +1536,8 @@ export class PrismDaemon {
           entry.mainFrameId = frame.id;
           entry.hasFrameTree = true;
           entry.pendingAckEpoch = 0;
+          entry.verifyDirty = true;
+          entry.healthyStreak = 0;
           if (typeof frame.url === 'string' && frame.url) {
             entry.url = frame.url;
           }
@@ -1507,8 +1563,10 @@ export class PrismDaemon {
       await session.send('Runtime.addBinding', { name: OMNI_BINDING });
 
       const healOnNav = () => {
+        entry.verifyDirty = true;
+        entry.healthyStreak = 0;
         setTimeout(() => {
-          void this.verifyAndHealEntry(entry);
+          void this.verifyAndHealEntry(entry, true);
         }, 50);
       };
       session.on('Page.domContentLoadedEventFired', healOnNav);
@@ -1539,8 +1597,19 @@ export class PrismDaemon {
     }
   }
 
-  async verifyAndHealEntry(entry) {
+  async verifyAndHealEntry(entry, force = false) {
     if (!entry || entry.session.closed) return { alive: false, ready: false, isHostDom: false };
+    const now = Date.now();
+    const hashMatches = !this.codeHash || entry.lastVerifiedCodeHash === this.codeHash;
+    if (!force && !entry.verifyDirty && hashMatches && entry.lastVerifyAt > 0 && entry.healthyStreak > 0) {
+      const browserLive = Boolean(this.browserSession && !this.browserSession.closed);
+      const backoffMs = browserLive
+        ? Math.min(15000, 3000 * Math.pow(2, Math.min(3, entry.healthyStreak - 1)))
+        : 4000;
+      if (now - entry.lastVerifyAt < backoffMs) {
+        return { alive: true, ready: true, isHostDom: true, skipped: true };
+      }
+    }
     try {
       const probe = await entry.session.evaluate(
         `(() => {
@@ -1558,6 +1627,7 @@ export class PrismDaemon {
         const st = api && typeof api.getState === 'function' ? api.getState() : null;
         const telMode = st?.cfg?.telemetryModule || 'auto';
         const omniMode = st?.cfg?.omniModule || 'on';
+        const isHome = Boolean(document.querySelector('.agy-home, [data-testid="home-greeting"]'));
         const hasModelBtn = Boolean(document.querySelector('[data-testid="model-selector-trigger"]'));
         const hasPulseBar = Boolean(
           document.querySelector(
@@ -1579,7 +1649,7 @@ export class PrismDaemon {
           omniMode,
           codeHash: (api && api.codeHash) || '',
           hasLegacyCss: Boolean(document.getElementById('ag-claude-style-css')),
-          needsDashboardSync: Boolean(api && telMode !== 'off' && hasModelBtn && !hasPulseBar),
+          needsDashboardSync: Boolean(api && telMode !== 'off' && !isHome && hasModelBtn && !hasPulseBar),
         };
       })()`,
         false,
@@ -1592,6 +1662,7 @@ export class PrismDaemon {
         !probe.hasOmniBridge ||
         !probe.hasOmniServerMeta ||
         (hasClientOnDisk && probe.omniMode !== 'off' && !probe.hasOmni);
+      let healed = false;
       if (
         !probe.hasPrism ||
         !probe.hasRepoBridge ||
@@ -1601,6 +1672,7 @@ export class PrismDaemon {
         probe.hasLegacyCss ||
         (this.codeHash && probe.codeHash && probe.codeHash !== this.codeHash)
       ) {
+        healed = true;
         await this.ensureOmniServer().catch(() => null);
         await entry.session.send('Runtime.addBinding', { name: this.cdp.SETTING_BINDING }, 2600).catch(() => {});
         await entry.session.send('Runtime.addBinding', { name: METRICS_BINDING }, 2600).catch(() => {});
@@ -1630,6 +1702,7 @@ export class PrismDaemon {
         this.log(`[↻] Hot-healed window to Obsidian Prism v${this.cdp.PLUGIN_VERSION}: ${entry.title}`);
       } else {
         if (needsOmniHeal) {
+          healed = true;
           await this.ensureOmniServer().catch(() => null);
           await entry.session.send('Runtime.addBinding', { name: OMNI_BINDING }, 2600).catch(() => {});
           if (this.omniExpr) {
@@ -1637,6 +1710,7 @@ export class PrismDaemon {
           }
         }
         if (probe.needsDashboardSync) {
+          healed = true;
           await entry.session
             .evaluate(
               `(() => {
@@ -1651,6 +1725,10 @@ export class PrismDaemon {
             .catch(() => {});
         }
       }
+      entry.lastVerifyAt = Date.now();
+      entry.verifyDirty = false;
+      entry.lastVerifiedCodeHash = this.codeHash || '';
+      entry.healthyStreak = healed ? 0 : Math.min(8, (entry.healthyStreak || 0) + 1);
       return { alive: true, ready: true, isHostDom: Boolean(probe.isHostDom), href: probe.href || '' };
     } catch {
       entry.session.close();
@@ -1713,7 +1791,19 @@ export class PrismDaemon {
       const onTargetEvent = (params) => {
         const info = params?.targetInfo;
         if (!info || info.type !== 'page') return;
-        if (!this._isEligibleDaemonTarget({ ...info, id: info.targetId || info.id, webSocketDebuggerUrl: 'ws://check' })) return;
+        const tid = info.targetId || info.id || '';
+        // If this page is already attached and healthy, only mark it dirty on URL shift rather than waking all pages
+        for (const existing of this.sessions.values()) {
+          if (tid && existing.pageId === tid) {
+            if (typeof info.url === 'string' && info.url && info.url !== existing.url) {
+              existing.verifyDirty = true;
+              existing.healthyStreak = 0;
+              this.scheduleImmediateTick(45);
+            }
+            return;
+          }
+        }
+        if (!this._isEligibleDaemonTarget({ ...info, id: tid, webSocketDebuggerUrl: 'ws://check' })) return;
         this.scheduleImmediateTick(45);
       };
       bSession.on('Target.targetCreated', onTargetEvent);
@@ -1765,25 +1855,51 @@ export class PrismDaemon {
   _maybeSyncShortcuts(force = false) {
     if (!this._isRelaunchGuardAllowed()) return null;
     if (process.env.PRISM_DISABLE_SHORTCUT_SYNC === '1' && !this._relaunchHooks?.syncShortcuts) return null;
+    if (this._shortcutSyncInFlight) {
+      if (force) this._shortcutForcePending = true;
+      return null;
+    }
     const now = Date.now();
     if (!force && this._lastShortcutCheckAt > 0 && now - this._lastShortcutCheckAt < this.shortcutCheckIntervalMs) {
       return null;
     }
-    this._lastShortcutCheckAt = now;
-    try {
-      const fn =
-        typeof this._relaunchHooks?.syncShortcuts === 'function'
-          ? this._relaunchHooks.syncShortcuts
-          : typeof this.cdp.ensureAntigravityShortcutsCdpFlag === 'function'
-          ? (opts) => this.cdp.ensureAntigravityShortcutsCdpFlag(opts)
-          : null;
-      if (!fn) return null;
-      const res = fn({ pluginDir: this.rootDir });
+    const onDone = (res) => {
+      if (res && !res.error) this._lastShortcutCheckAt = Date.now();
       if (res && Array.isArray(res.patched) && res.patched.length > 0) {
         this.log(`[shortcut-guard] Ensured --remote-debugging-port=0 on ${res.patched.length} shortcut(s)`);
       }
       return res;
+    };
+    const onFinally = () => {
+      this._shortcutSyncInFlight = false;
+      if (this._shortcutForcePending && this.running) {
+        this._shortcutForcePending = false;
+        void this._maybeSyncShortcuts(true);
+      }
+    };
+    try {
+      if (typeof this._relaunchHooks?.syncShortcuts === 'function') {
+        const res = this._relaunchHooks.syncShortcuts({ pluginDir: this.rootDir });
+        if (res && typeof res.then === 'function') {
+          this._shortcutSyncInFlight = true;
+          return res.then(onDone).catch(() => null).finally(onFinally);
+        }
+        return onDone(res);
+      }
+      if (typeof this.cdp.ensureAntigravityShortcutsCdpFlagAsync === 'function') {
+        this._shortcutSyncInFlight = true;
+        return this.cdp
+          .ensureAntigravityShortcutsCdpFlagAsync({ pluginDir: this.rootDir })
+          .then(onDone)
+          .catch(() => null)
+          .finally(onFinally);
+      }
+      if (typeof this.cdp.ensureAntigravityShortcutsCdpFlag === 'function') {
+        return onDone(this.cdp.ensureAntigravityShortcutsCdpFlag({ pluginDir: this.rootDir }));
+      }
+      return null;
     } catch {
+      this._shortcutSyncInFlight = false;
       return null;
     }
   }
@@ -1955,7 +2071,7 @@ export class PrismDaemon {
         if (!activeUrls.has(wsUrl)) {
           // Guard live workbench sessions against transient SPA title shifts (e.g. Swarm "Full View" -> "Untitled Conversation"):
           // verify actual in-page DOM before ever issuing REMOVE_EXPRESSION!
-          const check = await this.verifyAndHealEntry(entry);
+          const check = await this.verifyAndHealEntry(entry, true);
           if (check && check.alive && (!check.ready || check.isHostDom)) {
             continue;
           }
