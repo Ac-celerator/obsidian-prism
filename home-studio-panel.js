@@ -620,15 +620,7 @@
             subTok > 0
               ? typeof ui.swarmSplitSub === 'function'
                 ? ui.swarmSplitSub(mainPct, subPct)
-                : lang === 'en'
-                ? `Main ${mainPct}% · Swarm ${subPct}%`
-                : lang === 'ja'
-                ? `メイン ${mainPct}% · 子 ${subPct}%`
-                : lang === 'zh-TW'
-                ? `主工作階段 ${mainPct}% · 子代理 ${subPct}%`
-                : lang === 'yue'
-                ? `主對話 ${mainPct}% · 子代理 ${subPct}%`
-                : `主会话 ${mainPct}% · 子代理 ${subPct}%`
+                : `Main ${mainPct}% · Swarm ${subPct}%`
               : '';
 
           for (const [k, label, valText, titleText, subTxt] of [

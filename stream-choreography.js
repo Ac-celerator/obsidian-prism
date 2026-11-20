@@ -77,12 +77,14 @@
     };
     let lastHomeRect = null;
     let liftoffBubbleUntil = 0;
+    let suppressEntryMotionUntil = 0;
     let runInit = false;
     let wasRunning = false;
     let runStartAt = 0;
     let fiberTimer = 0;
     let sbInit = false;
     let sbIndex = -1;
+    let sbCid = '';
     let sbRect = null;
 
     const seenHeaders = new WeakSet();
@@ -715,7 +717,8 @@
         }
         states.push([r, Boolean(qs(r, '[data-testid="status-loading-spinner"]'))]);
       }
-      if (!selRow) return { e: false, i: -1, r: null, s: null, l: null, t: 0, st: states };
+      if (!selRow) return { e: false, i: -1, cid: '', r: null, s: null, l: null, t: 0, st: states };
+      const curCid = String(ga(selRow, 'data-cascade-id') || ga(qs(selRow, 'a[href]'), 'href') || '').trim();
       const list = peOf(selRow);
       const rr = rectOf(selRow);
       const lr = rectOf(list);
@@ -730,7 +733,7 @@
             rx: lr ? rr.left - lr.left : rr.left,
           }
         : null;
-      return { e: false, i: selIdx, r: selRow, s: snap, l: lr, t: stTop, st: states };
+      return { e: false, i: selIdx, cid: curCid, r: selRow, s: snap, l: lr, t: stTop, st: states };
     }
 
     function syncSidebarSelectionGlide(snap) {
@@ -743,6 +746,7 @@
         }
         sbInit = false;
         sbIndex = -1;
+        sbCid = '';
         sbRect = null;
         return;
       }
@@ -755,18 +759,22 @@
       if (snap.e) {
         sbInit = false;
         sbIndex = -1;
+        sbCid = '';
         sbRect = null;
         return;
       }
-      const { i: selIdx, r: selRow, s: curSnap, l: listRect, t: scrollTop } = snap;
+      const { i: selIdx, cid: curCid, r: selRow, s: curSnap, l: listRect, t: scrollTop } = snap;
       if (!selRow) return;
       if (!sbInit) {
         sbInit = true;
         sbIndex = selIdx;
+        sbCid = curCid;
         sbRect = curSnap;
         return;
       }
-      if (sbIndex >= 0 && selIdx >= 0 && selIdx !== sbIndex && sbRect && curSnap) {
+      // 虚拟滚动增删上下行会让同一会话的 DOM 下标 selIdx 漂移；仅在真实切换会话 ID 时触发滑条与主区转场，消除滚动闪烁
+      const sessionChanged = curCid && sbCid ? curCid !== sbCid : selIdx !== sbIndex;
+      if (sbIndex >= 0 && selIdx >= 0 && sessionChanged && sbRect && curSnap && !(suppressEntryMotionUntil > nowOf())) {
         const fromRect = listRect
           ? { left: listRect.left + sbRect.rx, top: listRect.top + sbRect.ry - scrollTop, width: sbRect.width, height: sbRect.height }
           : sbRect;
@@ -812,6 +820,7 @@
         }
       }
       sbIndex = selIdx;
+      sbCid = curCid;
       sbRect = curSnap;
     }
 
@@ -976,8 +985,12 @@
         heroState.wasInHome = inHome;
         heroState.wasInFormalConv = inFormalConv;
       } else {
-        if (heroState.wasInHome && !inHome && inFormalConv) triggerHeroALiftoff(formalConv, measured?.convInputRect || null);
-        else if (heroState.wasInFormalConv && !heroState.wasInHome && inHome) triggerHeroBHomeReturn();
+        if (!(suppressEntryMotionUntil > nowOf())) {
+          if (heroState.wasInHome && !inHome && inFormalConv) triggerHeroALiftoff(formalConv, measured?.convInputRect || null);
+          else if (heroState.wasInFormalConv && !heroState.wasInHome && inHome) triggerHeroBHomeReturn();
+        } else {
+          liftoffBubbleUntil = 0;
+        }
         heroState.wasInHome = inHome;
         heroState.wasInFormalConv = inFormalConv;
       }
@@ -1433,6 +1446,13 @@
       measureNewLensOverlays,
       syncLensOverlayOrigins,
       scheduleDeferredConvEntry,
+      suppressEntryMotion(ms) {
+        suppressEntryMotionUntil = Math.max(suppressEntryMotionUntil, nowOf() + Math.max(120, Number(ms) || 900));
+        liftoffBubbleUntil = 0;
+        const d = docOf();
+        if (d) for (const n of qsa(d, '.ag-cs-liftoff-veil,.ag-cs-sidebar-glide-pill')) n.remove();
+      },
+      isEntryMotionSuppressed: () => suppressEntryMotionUntil > nowOf(),
       isStreamMutating: () => streamMutating,
       hasStreamObserver: () => Boolean(streamObs && streamRoot),
       stepHighlightFade,

@@ -9,7 +9,7 @@ export class TrajectoryReader {
  // Serialized statistics budget, not transcript/response size. Local resource
  // experiments cover 1K/8K/32K records; 8 MiB bounds retained objects well below
  // the 32K-record case (~100 MiB extra heap). See docs/LONG_CONVERSATIONS.md.
- constructor(client,{budgetBytes=8*1024*1024,idleRecheckMs=10000,maxSummaryEntries=4096,maxPages=4096}={}){this.client=client;this.budgetBytes=budgetBytes;this.idleRecheckMs=idleRecheckMs;this.maxSummaryEntries=maxSummaryEntries;this.maxPages=maxPages;}
+ constructor(client,{budgetBytes=4*1024*1024,idleRecheckMs=30000,maxSummaryEntries=1024,maxPages=4096}={}){this.client=client;this.budgetBytes=budgetBytes;this.idleRecheckMs=idleRecheckMs;this.maxSummaryEntries=maxSummaryEntries;this.maxPages=maxPages;}
  failures=new Map();
  entries=new Map();epoch=0;endpoint=null;summaries=null;summaryAt=-Infinity;summaryPending=null;cachedBytes=0;
  reset(){this.epoch++;this.entries.clear();this.failures.clear();this.summaries=null;this.summaryAt=-Infinity;this.summaryPending=null;this.cachedBytes=0;}
@@ -17,7 +17,7 @@ export class TrajectoryReader {
  async summary(id,provided,force){
   if(provided)return provided;
     if(force&&this.summaries&&this.client.now()-this.summaryAt<30000)force=false;
-   if(force||!this.summaries||this.client.now()-this.summaryAt>=1800){
+   if(force||!this.summaries||this.client.now()-this.summaryAt>=6000){
    if(!this.summaryPending){const epoch=this.epoch;
     const pending=this.client.call('GetAllCascadeTrajectories',{excludeSubtrajectories:false}).then(r=>{
      if(epoch!==this.epoch)throw unavailable();
@@ -103,7 +103,7 @@ export class TrajectoryReader {
    while(count===null||steps.length<count){
     check();if(++pageCount>this.maxPages)throw new Error('会话统计分页数量超过上限');
     const offset=steps.length;if(stepPages.has(offset))throw new Error('会话统计分页没有推进');stepPages.add(offset);
-    const page=await this.client.call('GetCascadeTrajectorySteps',{cascadeId:id,stepOffset:offset,trajectoryVerbosity:3});check();
+    const page=await this.client.call('GetCascadeTrajectorySteps',{cascadeId:id,stepOffset:offset,trajectoryVerbosity:2});check();
     const items=page.steps||[];if(!Array.isArray(items))throw new Error('会话统计分页格式无效');
     if(!items.length){if(count===null)break;throw new Error('完整会话统计分页暂不可用');}append(steps,items,nextStepSizes);
     // Only compare stable item IDs. Some hosts legitimately return structurally
@@ -143,7 +143,7 @@ export class TrajectoryReader {
     while(this.failures.size>256)this.failures.delete(this.failures.keys().next().value);
    }
    throw error;
-  }).finally(()=>{entry.pending=null;if(!entry.data&&current())this.entries.delete(id);if(current())this.trim(id);});
+  }).finally(()=>{entry.pending=null;if(epoch===this.epoch&&this.entries.get(id)===entry){if(!entry.data)this.entries.delete(id);else if(isCurrent())this.trim(id);}});
   return entry.pending;
  }
 }

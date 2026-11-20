@@ -2597,7 +2597,23 @@ function bootPrismWorkbench(INIT_STATE, I18N_TABLE) {
 
     try {
       if (window.parent && window.parent !== window) {
-        window.parent.postMessage({ type: 'ag-prism-workbench-ready', kind: state.kind, path: state.path }, '*');
+        let targetOrigin = '*';
+        try {
+          if (typeof document !== 'undefined' && document.referrer) {
+            const ref = new URL(document.referrer);
+            if (
+              ref.origin &&
+              ref.origin !== 'null' &&
+              (ref.protocol === 'vscode-file:' ||
+                ref.protocol === 'app:' ||
+                ((ref.protocol === 'http:' || ref.protocol === 'https:') &&
+                  /^(?:127\.0\.0\.1|localhost|\[::1\])$/i.test(ref.hostname)))
+            ) {
+              targetOrigin = ref.origin;
+            }
+          }
+        } catch {}
+        window.parent.postMessage({ type: 'ag-prism-workbench-ready', kind: state.kind }, targetOrigin);
       }
     } catch {}
   }

@@ -7,10 +7,11 @@ const { execFile, execFileSync, spawn } = require('child_process');
 
 const STYLE_ID = 'ag-prism-css';
 const LEGACY_STYLE_ID = 'ag-claude-style-css';
-const PLUGIN_VERSION = '1.0.1';
+const PLUGIN_VERSION = '1.0.2';
 const SETTING_BINDING = '__agPrismSetting';
 const LEGACY_SETTING_BINDING = '__agClaudeStyleSetting';
 const OMNI_BINDING = '__agPrismOmniCall';
+const SIDEBAR_BINDING = '__agPrismSidebarCall';
 const IS_MAC = process.platform === 'darwin';
 const IS_WIN = process.platform === 'win32';
 
@@ -57,6 +58,7 @@ const DEFAULT_CONFIG = {
   thoughtView: 'immersive',
   omniModule: 'on',
   linkTarget: 'builtin',
+  sidebarStudio: 'off',
   pollIntervalMs: 2500,
 };
 
@@ -93,6 +95,7 @@ const VALIDATORS = {
   thoughtView: ['immersive', 'bilingual'],
   omniModule: ['on', 'off'],
   linkTarget: ['builtin', 'external'],
+  sidebarStudio: ['on', 'off'],
 };
 
 function validateConfigEntry(key, value) {
@@ -584,7 +587,7 @@ function writePatchedShortcutsRecord(pluginDir, pathsList) {
     fs.writeFileSync(
       tmpFile,
       JSON.stringify({ patchedPaths: uniq, updatedAt: Date.now() }, null, 2) + '\n',
-      'utf8'
+      { encoding: 'utf8', mode: 0o600 }
     );
     fs.renameSync(tmpFile, recFile);
   } catch {}
@@ -1121,7 +1124,7 @@ function recordRelaunchPromptState(pluginDir, hostPid, hostStartMs = 0, decision
       const dir = path.dirname(file);
       fs.mkdirSync(dir, { recursive: true });
       const tmp = `${file}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, jsonText, 'utf8');
+      fs.writeFileSync(tmp, jsonText, { encoding: 'utf8', mode: 0o600 });
       fs.renameSync(tmp, file);
     } catch {}
   }
@@ -1663,6 +1666,9 @@ function minifyCss(css) {
   let pendingWS = false;
   const NO_SPACE_AFTER = new Set(['{', '}', ';', ',', '>', '~', '(', ':']);
   const NO_SPACE_BEFORE = new Set(['{', '}', ';', ',', '>', '~', ')']);
+  const isHex = (c) => (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
+  const isIdCont = (c) =>
+    (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 45;
   while (i < n) {
     const ch = css[i];
     if (ch === "'" || ch === '"') {
@@ -1693,6 +1699,33 @@ function minifyCss(css) {
       pendingWS = true;
       continue;
     }
+    if (
+      (ch === 'u' || ch === 'U') &&
+      (css[i + 1] === 'r' || css[i + 1] === 'R') &&
+      (css[i + 2] === 'l' || css[i + 2] === 'L') &&
+      css[i + 3] === '('
+    ) {
+      if (pendingWS && out.length > 0 && !NO_SPACE_AFTER.has(out[out.length - 1])) {
+        out.push(' ');
+      }
+      pendingWS = false;
+      let j = i + 4;
+      let q = '';
+      while (j < n) {
+        const c = css[j];
+        if (q) {
+          if (c === '\\') { j += 2; continue; }
+          if (c === q) q = '';
+        } else {
+          if (c === "'" || c === '"') q = c;
+          else if (c === ')') { j++; break; }
+        }
+        j++;
+      }
+      out.push(css.slice(i, j));
+      i = j;
+      continue;
+    }
     if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
       pendingWS = true;
       i++;
@@ -1711,6 +1744,54 @@ function minifyCss(css) {
       out.push(' ');
     }
     pendingWS = false;
+    if (
+      ch === '#' &&
+      i + 6 < n &&
+      (i + 7 >= n || !isIdCont(css.charCodeAt(i + 7))) &&
+      isHex(css.charCodeAt(i + 1)) &&
+      isHex(css.charCodeAt(i + 2)) &&
+      isHex(css.charCodeAt(i + 3)) &&
+      isHex(css.charCodeAt(i + 4)) &&
+      isHex(css.charCodeAt(i + 5)) &&
+      isHex(css.charCodeAt(i + 6)) &&
+      css[i + 1].toLowerCase() === css[i + 2].toLowerCase() &&
+      css[i + 3].toLowerCase() === css[i + 4].toLowerCase() &&
+      css[i + 5].toLowerCase() === css[i + 6].toLowerCase()
+    ) {
+      let k = i + 7;
+      let pDepth = 0;
+      let inDeclVal = false;
+      while (k < n) {
+        const kc = css[k];
+        if (kc === "'" || kc === '"') {
+          k++;
+          while (k < n) {
+            if (css[k] === '\\') { k += 2; continue; }
+            if (css[k] === kc) { k++; break; }
+            k++;
+          }
+          continue;
+        }
+        if (kc === '/' && css[k + 1] === '*') {
+          k += 2;
+          while (k < n && !(css[k] === '*' && css[k + 1] === '/')) k++;
+          k += 2;
+          continue;
+        }
+        if (kc === '(') pDepth++;
+        else if (kc === ')') { if (pDepth > 0) pDepth--; }
+        else if (pDepth === 0) {
+          if (kc === ';' || kc === '}') { inDeclVal = true; break; }
+          if (kc === '{') break;
+        }
+        k++;
+      }
+      if (inDeclVal) {
+        out.push('#' + css[i + 1] + css[i + 3] + css[i + 5]);
+        i += 7;
+        continue;
+      }
+    }
     out.push(ch);
     i++;
   }
@@ -1780,10 +1861,6 @@ function collectWindowFrequencies(work, winLen, skipPua = false) {
     }
   }
   return freq;
-}
-
-function escapeRegExpLiteral(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function applyBatchPhraseReplacements(work, freq, freeTokens, dict, tokChars, contiguous, minGain, batchLimit = 160, fixedLen = 0) {
@@ -2030,6 +2107,31 @@ function packCssJsExpr(css) {
   return `(()=>{let s=${serializeJsValue(work)},d=${serializeStringListExpr(dict)};for(let f=1;f;)f=0,s=s.replace(/[\\u00A1-\\u${maxCodeHex}]/g,(c)=>(f=1,d[c.charCodeAt(0)-${TOKEN_BASE}]));return s})()`;
 }
 
+const GLSL_RESERVED_IDS = new Set(
+  (
+    'attribute const uniform varying buffer shared coherent volatile restrict readonly writeonly layout centroid flat smooth noperspective patch sample ' +
+    'break continue do for while switch case default if else subroutine in out inout invariant discard return struct precision highp mediump lowp true false void main ' +
+    'float double int uint bool vec2 vec3 vec4 dvec2 dvec3 dvec4 bvec2 bvec3 bvec4 ivec2 ivec3 ivec4 uvec2 uvec3 uvec4 ' +
+    'mat2 mat3 mat4 mat2x2 mat2x3 mat2x4 mat3x2 mat3x3 mat3x4 mat4x2 mat4x3 mat4x4 ' +
+    'dmat2 dmat3 dmat4 dmat2x2 dmat2x3 dmat2x4 dmat3x2 dmat3x3 dmat3x4 dmat4x2 dmat4x3 dmat4x4 ' +
+    'sampler1D sampler2D sampler3D samplerCube sampler2DRect sampler1DShadow sampler2DShadow samplerCubeShadow sampler2DRectShadow ' +
+    'sampler1DArray sampler2DArray sampler1DArrayShadow sampler2DArrayShadow samplerBuffer sampler2DMS sampler2DMSArray ' +
+    'isampler1D isampler2D isampler3D isamplerCube isampler2DRect isampler1DArray isampler2DArray isamplerBuffer isampler2DMS isampler2DMSArray ' +
+    'usampler1D usampler2D usampler3D usamplerCube usampler2DRect usampler1DArray usampler2DArray usamplerBuffer usampler2DMS usampler2DMSArray ' +
+    'samplerCubeArray samplerCubeArrayShadow isamplerCubeArray usamplerCubeArray ' +
+    'radians degrees sin cos tan asin acos atan sinh cosh tanh asinh acosh atanh pow exp log exp2 log2 sqrt inversesqrt ' +
+    'abs sign floor trunc round roundEven ceil fract mod modf min max clamp mix step smoothstep isnan isinf ' +
+    'floatBitsToInt floatBitsToUint intBitsToFloat uintBitsToFloat packSnorm2x16 unpackSnorm2x16 packUnorm2x16 unpackUnorm2x16 packHalf2x16 unpackHalf2x16 ' +
+    'length distance dot cross normalize faceforward reflect refract matrixCompMult outerProduct transpose determinant inverse ' +
+    'lessThan lessThanEqual greaterThan greaterThanEqual equal notEqual any all not ' +
+    'textureSize texture textureProj textureLod textureOffset texelFetch texelFetchOffset textureProjOffset textureLodOffset textureProjLod textureProjLodOffset ' +
+    'textureGrad textureGradOffset textureProjGrad textureProjGradOffset dFdx dFdy fwidth'
+  ).split(' ')
+);
+const GLSL_INTERFACE_QUALS = new Set(['uniform', 'in', 'out', 'varying', 'attribute', 'layout', 'buffer', 'shared']);
+const GLSL_SHORT_CHARS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const GLSL_SHORT_REST = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
 function minifyGlsl(glsl) {
   let noComments = '';
   for (let i = 0; i < glsl.length; ) {
@@ -2064,10 +2166,208 @@ function minifyGlsl(glsl) {
           .replace(/\s*([{}();,=*/<>?:])\s*/g, '$1')
           .replace(/\s*([+\-])\s*(?!\1)/g, '$1')
           .replace(/([+\-])\s+(?![+\-])/g, '$1')
+          .replace(/(?<![\w.])(\d+\.\d*?[1-9])0+(?![\w.])/g, '$1')
+          .replace(/(?<![\w.])(\d+)\.0+(?![\w.])/g, '$1.')
+          .replace(/(?<![\w.])0(\.\d+)/g, '$1')
       );
     }
   }
-  return res.join('').trim();
+  const compact = res.join('').trim();
+
+  // Pass 1: Lex into preproc / num / id / ch tokens
+  const tokens = [];
+  const protectedIds = new Set();
+  const allIds = new Set();
+  const len = compact.length;
+  for (let i = 0; i < len; ) {
+    const ch = compact[i];
+    if (ch === '#' && (i === 0 || compact[i - 1] === '\n')) {
+      let j = i + 1;
+      while (j < len && compact[j] !== '\n') j++;
+      if (j < len && compact[j] === '\n') j++;
+      const pre = compact.slice(i, j);
+      tokens.push({ t: 'pre', v: pre });
+      for (const m of pre.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)) {
+        protectedIds.add(m[0]);
+        allIds.add(m[0]);
+      }
+      i = j;
+      continue;
+    }
+    const c = compact.charCodeAt(i);
+    if ((c >= 48 && c <= 57) || (ch === '.' && i + 1 < len && compact.charCodeAt(i + 1) >= 48 && compact.charCodeAt(i + 1) <= 57)) {
+      const m = /^(?:0[xX][0-9a-fA-F]+|\d+\.\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?|\d+(?:[eE][+-]?\d+)?)[uUfF]?/.exec(
+        compact.slice(i)
+      );
+      if (m) {
+        tokens.push({ t: 'num', v: m[0] });
+        i += m[0].length;
+        continue;
+      }
+    }
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95) {
+      let j = i + 1;
+      while (j < len) {
+        const cj = compact.charCodeAt(j);
+        if ((cj >= 65 && cj <= 90) || (cj >= 97 && cj <= 122) || (cj >= 48 && cj <= 57) || cj === 95) j++;
+        else break;
+      }
+      const id = compact.slice(i, j);
+      tokens.push({ t: 'id', v: id });
+      allIds.add(id);
+      i = j;
+      continue;
+    }
+    tokens.push({ t: 'ch', v: ch });
+    i++;
+  }
+
+  // Pass 2: Collect protected identifiers (interface qualifiers, struct blocks/fields, dot members, reserved/gl_)
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let stmtIds = [];
+  let stmtHasInterface = false;
+  let structPending = false;
+  let protectedBlockDepth = -1;
+  let prevSig = null;
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tk = tokens[i];
+    if (tk.t === 'pre') continue;
+    if (tk.t === 'ch' && (tk.v === ' ' || tk.v === '\n')) continue;
+
+    if (tk.t === 'id') {
+      const v = tk.v;
+      if (prevSig && prevSig.t === 'ch' && prevSig.v === '.') {
+        protectedIds.add(v);
+      }
+      if (GLSL_RESERVED_IDS.has(v) || v.startsWith('gl_') || v.startsWith('__')) {
+        protectedIds.add(v);
+      }
+      if (protectedBlockDepth >= 0 || structPending) {
+        protectedIds.add(v);
+      }
+      if (v === 'struct') {
+        structPending = true;
+      }
+      if (braceDepth === 0) {
+        if (parenDepth === 0 && GLSL_INTERFACE_QUALS.has(v)) {
+          stmtHasInterface = true;
+        }
+        stmtIds.push(v);
+      }
+    } else if (tk.t === 'ch') {
+      if (tk.v === '{') {
+        if (stmtHasInterface || structPending) {
+          for (const sid of stmtIds) protectedIds.add(sid);
+          if (protectedBlockDepth < 0) protectedBlockDepth = braceDepth;
+        }
+        braceDepth++;
+        if (braceDepth === 1) {
+          stmtIds = [];
+          stmtHasInterface = false;
+        }
+      } else if (tk.v === '}') {
+        braceDepth = Math.max(0, braceDepth - 1);
+        if (braceDepth === 0 && parenDepth === 0 && protectedBlockDepth < 0) {
+          stmtIds = [];
+          stmtHasInterface = false;
+        }
+      } else if (tk.v === '(') {
+        parenDepth++;
+      } else if (tk.v === ')') {
+        parenDepth = Math.max(0, parenDepth - 1);
+      } else if (tk.v === ';') {
+        if (braceDepth === 0 && parenDepth === 0) {
+          if (stmtHasInterface) {
+            for (const sid of stmtIds) protectedIds.add(sid);
+          }
+          stmtIds = [];
+          stmtHasInterface = false;
+        }
+        if (protectedBlockDepth >= 0 && braceDepth === protectedBlockDepth) {
+          protectedBlockDepth = -1;
+          structPending = false;
+        } else if (structPending && protectedBlockDepth < 0) {
+          structPending = false;
+        }
+      }
+    }
+    prevSig = tk;
+  }
+
+  // Pass 3: Count local renameable identifiers and assign shortest collision-free names by savings
+  const counts = new Map();
+  prevSig = null;
+  for (let i = 0; i < tokens.length; i++) {
+    const tk = tokens[i];
+    if (tk.t === 'pre') continue;
+    if (tk.t === 'ch' && (tk.v === ' ' || tk.v === '\n')) continue;
+    if (tk.t === 'id' && !(prevSig && prevSig.t === 'ch' && prevSig.v === '.') && !protectedIds.has(tk.v) && tk.v.length >= 2) {
+      counts.set(tk.v, (counts.get(tk.v) || 0) + 1);
+    }
+    prevSig = tk;
+  }
+
+  const candidates = Array.from(counts.entries()).sort((a, b) => {
+    const saveDiff = (b[0].length - 1) * b[1] - (a[0].length - 1) * a[1];
+    return saveDiff !== 0 ? saveDiff : a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
+  });
+
+  const usedNames = new Set([...protectedIds, ...allIds]);
+  const renameMap = new Map();
+  let seqIdx = 0;
+  const nextShortName = () => {
+    const cLen = GLSL_SHORT_CHARS.length;
+    const rLen = GLSL_SHORT_REST.length;
+    while (true) {
+      let cand = '';
+      if (seqIdx < cLen) {
+        cand = GLSL_SHORT_CHARS[seqIdx];
+      } else {
+        let rem = seqIdx - cLen;
+        const first = GLSL_SHORT_CHARS[Math.floor(rem / rLen) % cLen];
+        const second = GLSL_SHORT_REST[rem % rLen];
+        cand = rem < cLen * rLen ? first + second : first + second + String(Math.floor(rem / (cLen * rLen)));
+      }
+      seqIdx++;
+      if (!usedNames.has(cand) && !GLSL_RESERVED_IDS.has(cand) && !cand.startsWith('gl_') && !cand.startsWith('__')) {
+        usedNames.add(cand);
+        return cand;
+      }
+    }
+  };
+
+  for (const [orig] of candidates) {
+    const cand = nextShortName();
+    if (cand.length < orig.length) {
+      renameMap.set(orig, cand);
+    }
+  }
+
+  if (renameMap.size === 0) return compact;
+
+  // Pass 4: Emit renamed GLSL
+  const out = [];
+  prevSig = null;
+  for (let i = 0; i < tokens.length; i++) {
+    const tk = tokens[i];
+    if (tk.t === 'pre') {
+      out.push(tk.v);
+      continue;
+    }
+    if (tk.t === 'ch' && (tk.v === ' ' || tk.v === '\n')) {
+      out.push(tk.v);
+      continue;
+    }
+    if (tk.t === 'id' && !(prevSig && prevSig.t === 'ch' && prevSig.v === '.') && renameMap.has(tk.v)) {
+      out.push(renameMap.get(tk.v));
+    } else {
+      out.push(tk.v);
+    }
+    prevSig = tk;
+  }
+  return out.join('');
 }
 
 function tokenizeJs(src) {
@@ -3773,6 +4073,7 @@ const SAFE_ALIAS_GLOBALS = new Set([
   'clearTimeout',
   'setInterval',
   'clearInterval',
+  'performance',
 ]);
 
 function applyModulePoolReplacements(tokens, selectedEntries, headerBuilder) {
@@ -3836,6 +4137,15 @@ function applyModulePoolReplacements(tokens, selectedEntries, headerBuilder) {
     const nx = nextSig[i];
     if (p && (p.val === '.' || p.val === '?.' || p.val === 'function')) continue;
     if (nx && nx.val === ':') continue;
+    if (
+      nx &&
+      (nx.val === '.' || nx.val === '?.') &&
+      !(p && (p.val === 'let' || p.val === 'const' || p.val === 'var' || p.val === 'typeof'))
+    ) {
+      if (!globalPositions.has(tk.val)) globalPositions.set(tk.val, []);
+      globalPositions.get(tk.val).push(i);
+      continue;
+    }
     if (
       (p &&
         (p.val === 'let' ||
@@ -4302,7 +4612,9 @@ function stripUnusedUpstreamMenuObserver(src) {
     .replace(/(var\s+SLIDER_CSS\s*=\s*)("(?:\\.|[^"\\])*")/, (full, p1, lit) => {
       try {
         const rawCss = JSON.parse(lit);
-        const cleaned = rawCss.replace(/(?:\.ces-set(?:-[a-z-]+)?(?::hover|\.is-on)?\{[^{}]*\})+/g, '');
+        const cleaned = rawCss
+          .replace(/(?:\.ces-set(?:-[a-z-]+)?(?::hover|\.is-on)?\{[^{}]*\})+/g, '')
+          .replace(/\[role='menu(?:item)?'\]:has\([^{}]*\{[^{}]*\}/g, '');
         return p1 + serializeJsValue(minifyCss(cleaned));
       } catch {
         return full;
@@ -4714,8 +5026,8 @@ function compileUnifiedBundle() {
   for (const g of globalStats.values()) {
     const lzPoolCost = g.valBytes >= 8 ? Math.ceil(g.valBytes * 0.62) + 2 : g.valBytes + 2;
     const netSave = g.totalOrig - (lzPoolCost + g.totalReplEst);
-    // Multi-occurrence strings/props save via deduplication; single-occurrence strings >= 23B save via shared LZ phrase dictionary!
-    if ((g.totalOccs >= 2 && netSave >= 1) || (g.hasStr && g.valBytes >= 23)) {
+    // Multi-occurrence strings/props save via deduplication; single-occurrence strings >= 23B save via shared LZ phrase dictionary (skip pre-compressed high-entropy blobs).
+    if ((g.totalOccs >= 2 && netSave >= 1) || (g.hasStr && g.valBytes >= 23 && !g.strVal.startsWith('^]t'))) {
       const sortScore = g.totalOccs >= 2 ? netSave + Math.floor(g.valBytes * 0.25) : Math.floor(g.valBytes * 0.35) - 5;
       poolCandidates.push({ ...g, netSave, sortScore });
     }
@@ -4864,8 +5176,21 @@ function buildConfigRefreshExpression(customConfig, extraMeta = null) {
       } else {
         try { window.__agPrismOmni?.sync?.(effectiveCfg, window.__agPrismOmniServerMeta || null); } catch {}
       }
+      if (effectiveCfg?.sidebarStudio !== 'on') {
+        try { window.__agPrismSidebar?.sync?.(effectiveCfg, window.__agPrismSidebarMeta || null); } catch {}
+        try { window.__agPrismSidebar?.destroy?.(); } catch {}
+        try { delete window.__agPrismSidebar; } catch {}
+        try {
+          if (document.documentElement) {
+            ['data-ag-prism-mode', 'data-ag-prism-chat-kind', 'data-ag-prism-chat-telemetry', 'data-ag-cs-space', 'data-ag-cs-space-palette', 'data-ag-cs-space-accent'].forEach((a) => document.documentElement.removeAttribute(a));
+          }
+        } catch {}
+      } else {
+        try { window.__agPrismSidebar?.sync?.(effectiveCfg, window.__agPrismSidebarMeta || null); } catch {}
+      }
       if (document.documentElement) {
         document.documentElement.setAttribute('data-ag-prism-thought-view', effectiveCfg?.thoughtView === 'bilingual' ? 'bilingual' : 'immersive');
+        document.documentElement.setAttribute('data-ag-prism-sidebar-studio', effectiveCfg?.sidebarStudio === 'on' ? 'on' : 'off');
       }
       return { refreshed: true, version: api.version };
     }
@@ -4880,23 +5205,6 @@ function getInjectWrapperTemplate() {
   const rawTpl = `(() => {
     let _cssVal = null;
     const getCss = () => (_cssVal === null ? (_cssVal = __AG_INJ_CSS__) : _cssVal);
-    const migrateLegacyStorage = () => {
-      try {
-        if (typeof localStorage === 'undefined' || !localStorage) return;
-        const legacyKey = 'ag-claude-style:config';
-        const prismKey = 'ag-prism:config';
-        const v3Key = 'agClaudeStyle.settings.v3';
-        const legacyRaw = localStorage.getItem(legacyKey);
-        const v3Raw = localStorage.getItem(v3Key);
-        const prismRaw = localStorage.getItem(prismKey);
-        if (!prismRaw && (legacyRaw || v3Raw)) {
-          localStorage.setItem(prismKey, legacyRaw || v3Raw);
-        }
-        if (!v3Raw && (prismRaw || legacyRaw)) {
-          localStorage.setItem(v3Key, prismRaw || legacyRaw);
-        }
-      } catch {}
-    };
     const cleanupLegacyResidue = () => {
       try {
         const oldStyle = document.getElementById(${JSON.stringify(LEGACY_STYLE_ID)});
@@ -5234,7 +5542,6 @@ function getInjectWrapperTemplate() {
             globalThis.__agCsUiMain(bootCfg);
           }
         }
-        migrateLegacyStorage();
         if (window.__agClaudeStyle && !window.__agPrism) {
           window.__agPrism = window.__agClaudeStyle;
         } else if (window.__agPrism) {
@@ -5242,9 +5549,6 @@ function getInjectWrapperTemplate() {
         }
         const liveState = window.__agPrism && typeof window.__agPrism.getState === 'function' ? window.__agPrism.getState() : null;
         const effectiveCfg = (liveState && liveState.cfg) || bootCfg;
-        try { window.__agPrismTelemetry?.sync?.(effectiveCfg); } catch {}
-        try { window.__agPrismEffortSlider?.sync?.(effectiveCfg); } catch {}
-        try { window.__agPrismThought?.sync?.(effectiveCfg); } catch {}
         if (effectiveCfg?.omniModule === 'off') {
           try { window.__agPrismOmni?.destroy?.(); } catch {}
         } else {
@@ -5487,6 +5791,228 @@ function buildOmniClientExpression(serverMeta = null, customClientSource = null)
   })()`;
 }
 
+function serializeJsonForEval(val) {
+  const raw = JSON.stringify(val === undefined ? null : val);
+  return String(raw).replace(/[<>/\u2028\u2029]/g, (ch) =>
+    `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`
+  );
+}
+
+let _sidebarClientCache = { sig: '', minCode: '', codeHash: '' };
+
+function isSafeV2SidebarClientSource(src) {
+  if (typeof src !== 'string' || !src.trim()) return false;
+  if (!src.includes('SIDEBAR_STUDIO_CLIENT_V2')) return false;
+  // 任何出现 setPrefValue / setPrefValues 标识符或字符串字面量的客户端源码一律拒载（含括号属性访问）
+  if (/setPrefValues?/i.test(src)) return false;
+  return true;
+}
+
+function readCompiledSidebarClient() {
+  const sidebarPath = path.join(__dirname, 'vendor', 'sidebar-studio', 'sidebar-client.js');
+  if (!fs.existsSync(sidebarPath)) {
+    return { minCode: '', codeHash: '' };
+  }
+  const sig = getFileSig(sidebarPath);
+  if (_sidebarClientCache.sig === sig) {
+    return _sidebarClientCache;
+  }
+  const raw = fs.readFileSync(sidebarPath, 'utf8');
+  if (!isSafeV2SidebarClientSource(raw)) {
+    return { minCode: '', codeHash: '' };
+  }
+  const minCode = minifySingleSource(raw);
+  const codeHash = computeHash(minCode);
+  _sidebarClientCache = { sig, minCode, codeHash };
+  return _sidebarClientCache;
+}
+
+// 第三通道独立注入（Sidebar Studio）：绝不挤占静态主包 670KiB 配额，支持服务端 meta 热同步、codeHash 快速跳过与热启停卸载
+function buildSidebarStudioExpression(serverMeta = null, customClientSource = null) {
+  let minCode = '';
+  let codeHash = '';
+  if (typeof customClientSource === 'string') {
+    minCode = customClientSource && isSafeV2SidebarClientSource(customClientSource)
+      ? minifySingleSource(customClientSource)
+      : '';
+    codeHash = minCode ? computeHash(minCode) : '';
+  } else {
+    const compiled = readCompiledSidebarClient();
+    minCode = compiled.minCode;
+    codeHash = compiled.codeHash;
+  }
+
+  const metaJson = serializeJsonForEval(serverMeta && typeof serverMeta === 'object' ? serverMeta : null);
+  const hashJson = serializeJsonForEval(codeHash);
+  const verJson = serializeJsonForEval(PLUGIN_VERSION);
+
+  return `(() => {
+    try {
+      const loc = typeof window !== 'undefined' && window.location;
+      const href = loc && typeof loc.href === 'string' ? loc.href : '';
+      if (href) {
+        const low = href.toLowerCase();
+        if (low.startsWith('devtools://') || low.startsWith('data:') || low.startsWith('chrome:') || low.startsWith('chrome-extension:') || low.startsWith('edge:') || low.startsWith('blob:') || low.startsWith('plugin:')) {
+          return { ok: false, status: 'skipped-non-host' };
+        }
+        if (low.startsWith('vscode-file://') || low.startsWith('app://') || low.startsWith('about:')) {
+          const ttl = String(document.title || '').trim();
+          if (/^(?:untitled|launchpad)$/i.test(ttl) || /\\/launchpad(?:\\.html)?(?:[?#]|$)/i.test(low)) {
+            return { ok: false, status: 'skipped-non-host' };
+          }
+        }
+        if (low.startsWith('http:') || low.startsWith('https:')) {
+          const m = /^(https?):\\/\\/(127\\.0\\.0\\.1|localhost|\\[::1\\])(?::\\d+)?(\\/[^?#]*)?(?:[?#]|$)/i.exec(href);
+          if (!m) return { ok: false, status: 'skipped-non-host' };
+          const pathname = (m[3] || '/').toLowerCase();
+          if (/^\\/(?:viewer(?:\\/|$)|sandbox(?:\\/|$)|stream(?:\\/|$)|api(?:\\/|$))/.test(pathname)) {
+            return { ok: false, status: 'skipped-non-host' };
+          }
+          const hasDomMarker =
+            Boolean(window.__agPrism || window.__agClaudeStyle) ||
+            Boolean(
+              document.body &&
+                document.body.classList &&
+                (document.body.classList.contains('theme-standalone') || document.body.classList.contains('monaco-workbench'))
+            ) ||
+            Boolean(
+              document.querySelector &&
+                document.querySelector(
+                  '.agy-shell, .agy-home, [data-testid="aux-pane-split"], [data-testid="conversation-view"], [data-testid="agent-input-box"], [data-testid="model-selector-trigger"], .monaco-workbench'
+                )
+            );
+          const isPlainHttp = m[1].toLowerCase() === 'http';
+          const hasTitleMarker = !isPlainHttp && /\\bantigravity\\b/i.test(String(document.title || ''));
+          if (!hasDomMarker && !hasTitleMarker && (isPlainHttp || String(document.readyState || '') === 'complete')) {
+            return { ok: false, status: 'skipped-non-host' };
+          }
+        }
+      }
+    } catch {}
+
+    const serverMeta = ${metaJson};
+    window.__agPrismSidebarMeta = serverMeta;
+
+    if (!window.__agPrismSidebarBridge || !window.__agPrismSidebarBridge.__prismBridgeReady) {
+      try { window.__agPrismSidebarBridge?.dispose?.(); } catch {}
+      const pending = new Map();
+      let seq = 0;
+      const sendSidebarRpc = (reqObj, timeoutMs = 15000) => {
+        const payload = reqObj && typeof reqObj === 'object' ? { ...reqObj } : { action: String(reqObj || 'get-state') };
+        const act = payload.action || 'get-state';
+        if (typeof window.${SIDEBAR_BINDING} !== 'function') {
+          return Promise.resolve({ ok: false, offline: true, action: act, error: { code: 'CAPABILITY_UNAVAILABLE', message: 'Sidebar Studio daemon offline', retryable: true } });
+        }
+        return new Promise((resolve) => {
+          if (pending.size >= 32) {
+            resolve({ ok: false, busy: true, action: act, error: { code: 'BUSY', message: 'Sidebar RPC queue full', retryable: true } });
+            return;
+          }
+          const id = ++seq;
+          const timer = setTimeout(() => {
+            pending.delete(id);
+            resolve({ ok: false, timeout: true, action: act, error: { code: 'CAPABILITY_UNAVAILABLE', message: 'Sidebar RPC timeout', retryable: true } });
+          }, timeoutMs);
+          pending.set(id, { resolve, timer });
+          try {
+            window.${SIDEBAR_BINDING}(JSON.stringify({ id, version: 2, ...payload, action: act }));
+          } catch (err) {
+            clearTimeout(timer);
+            pending.delete(id);
+            resolve({ ok: false, action: act, error: { code: 'INVALID_ARGUMENT', message: String(err && err.message ? err.message : err) } });
+          }
+        });
+      };
+      const bridge = {
+        __prismBridgeReady: true,
+        schemaVersion: 2,
+        isOnline: () => typeof window.${SIDEBAR_BINDING} === 'function',
+        getMeta: () => window.__agPrismSidebarMeta || null,
+        call: sendSidebarRpc,
+        rpc: sendSidebarRpc,
+        getState: () => sendSidebarRpc({ action: 'get-state' }, 8000),
+        syncCatalog: (payload) => sendSidebarRpc({ action: 'sync-catalog', payload: payload && typeof payload === 'object' ? payload : {} }, 8000),
+        createSparkBox: (opts) => sendSidebarRpc({ action: 'create-spark-box', payload: typeof opts === 'string' ? { name: opts } : (opts || {}) }, 15000),
+        pickFolder: (opts) => sendSidebarRpc({ action: 'pick-folder', payload: opts && typeof opts === 'object' ? opts : {} }, 120000),
+        revealFolder: (opts) => sendSidebarRpc({ action: 'reveal-folder', payload: typeof opts === 'string' ? { path: opts } : (opts || {}) }, 10000),
+        resolve: (id, res) => {
+          const item = pending.get(id);
+          if (!item) return;
+          clearTimeout(item.timer);
+          pending.delete(id);
+          item.resolve(res);
+        },
+        dispose: () => {
+          for (const item of pending.values()) {
+            clearTimeout(item.timer);
+            item.resolve({ ok: false, disposed: true });
+          }
+          pending.clear();
+        },
+      };
+      window.__agPrismSidebarBridge = bridge;
+      if (typeof window.__agPrismSidebarResolve !== 'function') {
+        window.__agPrismSidebarResolve = bridge.resolve;
+      }
+    }
+
+    const cleanupSidebarDom = (preserveRuntimeState = false) => {
+      try { window.__agPrismSidebar?.destroy?.({ preserveRuntimeState: Boolean(preserveRuntimeState) }); } catch {}
+      try { delete window.__agPrismSidebar; } catch {}
+      try {
+        document.getElementById('ag-prism-sidebar-studio-css')?.remove();
+        document.querySelectorAll('[data-ag-prism-sidebar-owned="1"], .ag-prism-sidebar-studio, .ag-prism-sidebar-rail, .ag-prism-sidebar-popover, .ag-prism-sidebar-modal').forEach((n) => n.remove());
+        if (!preserveRuntimeState && document.documentElement) {
+          ['data-ag-prism-mode', 'data-ag-prism-chat-kind', 'data-ag-prism-chat-telemetry', 'data-ag-cs-space', 'data-ag-cs-space-palette', 'data-ag-cs-space-accent'].forEach((a) => document.documentElement.removeAttribute(a));
+        }
+      } catch {}
+    };
+
+    const sidebarHash = ${hashJson};
+    if (!sidebarHash) {
+      const prismApi0 = window.__agPrism || window.__agClaudeStyle;
+      const cfg0 = prismApi0 && typeof prismApi0.getState === 'function' ? prismApi0.getState()?.cfg || {} : {};
+      if (cfg0.sidebarStudio !== 'on') {
+        cleanupSidebarDom(false);
+        return { ok: true, status: 'disabled', version: ${verJson} };
+      }
+      return { ok: true, status: 'bridge-only', version: ${verJson} };
+    }
+
+    let sidebarStatus = 'deferred';
+    const mountSidebar = () => {
+      const prismApi = window.__agPrism || window.__agClaudeStyle;
+      const st = prismApi && typeof prismApi.getState === 'function' ? prismApi.getState() : null;
+      const cfg = (st && st.cfg) || {};
+      if (document.documentElement) {
+        document.documentElement.setAttribute('data-ag-prism-sidebar-studio', cfg.sidebarStudio === 'on' ? 'on' : 'off');
+      }
+      if (cfg.sidebarStudio !== 'on') {
+        cleanupSidebarDom(false);
+        sidebarStatus = 'disabled';
+        return;
+      }
+      const existing = window.__agPrismSidebar;
+      const reused = Boolean(existing && !existing.destroyed && existing.codeHash === sidebarHash && typeof existing.sync === 'function');
+      if (!reused) {
+        cleanupSidebarDom(true);
+        ${minCode};
+        if (window.__agPrismSidebar && typeof window.__agPrismSidebar === 'object') {
+          window.__agPrismSidebar.codeHash = sidebarHash;
+        }
+      }
+      sidebarStatus = reused ? 'synced' : window.__agPrismSidebar ? 'mounted' : 'ready';
+      try { window.__agPrismSidebar?.sync?.(cfg, serverMeta); } catch {}
+    };
+    if (document.documentElement) {
+      mountSidebar();
+    } else {
+      document.addEventListener('DOMContentLoaded', mountSidebar, { once: true });
+    }
+    return { ok: true, status: sidebarStatus, version: ${verJson}, codeHash: sidebarHash };
+  })()`;
+}
+
 const REMOVE_EXPRESSION = `(() => {
   try {
     if (window.__agPrismTelemetry && typeof window.__agPrismTelemetry.destroy === 'function') {
@@ -5506,6 +6032,11 @@ const REMOVE_EXPRESSION = `(() => {
   try {
     if (window.__agPrismOmni && typeof window.__agPrismOmni.destroy === 'function') {
       window.__agPrismOmni.destroy();
+    }
+  } catch (e) {}
+  try {
+    if (window.__agPrismSidebar && typeof window.__agPrismSidebar.destroy === 'function') {
+      window.__agPrismSidebar.destroy({ preserveRuntimeState: false });
     }
   } catch (e) {}
   if (Array.isArray(globalThis.__agCsCleanups)) {
@@ -5547,6 +6078,11 @@ const REMOVE_EXPRESSION = `(() => {
       window.__agPrismOmniBridge.dispose();
     }
   } catch (e) {}
+  try {
+    if (window.__agPrismSidebarBridge && typeof window.__agPrismSidebarBridge.dispose === 'function') {
+      window.__agPrismSidebarBridge.dispose();
+    }
+  } catch (e) {}
   delete window.__agPrism;
   delete window.__agClaudeStyle;
   delete window.__agPrismTelemetry;
@@ -5556,6 +6092,10 @@ const REMOVE_EXPRESSION = `(() => {
   delete window.__agPrismOmniBridge;
   delete window.__agPrismOmniResolve;
   delete window.__agPrismOmniServerMeta;
+  delete window.__agPrismSidebar;
+  delete window.__agPrismSidebarBridge;
+  delete window.__agPrismSidebarResolve;
+  delete window.__agPrismSidebarMeta;
   delete window.__agPrismMetricsResolve;
   delete window.__agPrismRepoBridge;
   delete window.__agPrismRepoResolve;
@@ -5573,6 +6113,7 @@ const REMOVE_EXPRESSION = `(() => {
   delete globalThis.__agPrismEffortSlider;
   delete globalThis.__agPrismThought;
   delete globalThis.__agPrismOmni;
+  delete globalThis.__agPrismSidebar;
   delete globalThis.__agPrismThoughtSettingsUi;
   delete globalThis.__agPrismSettingsPanel;
   delete globalThis.__agPrismHomeStudioPanel;
@@ -5634,6 +6175,14 @@ const REMOVE_EXPRESSION = `(() => {
       'data-ag-prism-thought-view',
       'data-ag-prism-omni',
       'data-ag-prism-link-target',
+      'data-ag-prism-sidebar-studio',
+      'data-ag-prism-mode',
+      'data-ag-prism-sidebar-host-sync',
+      'data-ag-prism-sidebar-space',
+      'data-ag-cs-space',
+      'data-ag-cs-space-palette',
+      'data-ag-cs-space-accent',
+      'data-ag-cs-win-blur',
     ].forEach((attr) => root.removeAttribute(attr));
     if (root.getAttribute('data-ag-cjk') === '1') root.removeAttribute('data-ag-cjk');
     if (root.style && typeof root.style.removeProperty === 'function') {
@@ -5740,10 +6289,16 @@ const REMOVE_EXPRESSION = `(() => {
   if (prismSliderStyle) prismSliderStyle.remove();
   const prismHideSlider = document.getElementById('ag-prism-effort-slider-hide');
   if (prismHideSlider) prismHideSlider.remove();
+  document.querySelectorAll('style[data-ag-turbo-dedup]').forEach((s) => {
+    s.disabled = false;
+    try { if (s.sheet) s.sheet.disabled = false; } catch (e) {}
+    s.removeAttribute('data-ag-turbo-dedup');
+  });
+  document.querySelectorAll('img[data-ag-turbo-img]').forEach((img) => img.removeAttribute('data-ag-turbo-img'));
   const nodes = document.querySelectorAll(
     '#' + ${JSON.stringify(STYLE_ID)} +
     ', #' + ${JSON.stringify(LEGACY_STYLE_ID)} +
-    ', #ag-prism-settings-v101-css, #ag-prism-omni-css, #ag-cs-settings-sec, .ag-omni-dock, .ag-omni-menu, .ag-prism-omni-menu, .ag-prism-omni-pane, [data-ag-prism-omni-owned="1"], .ag-cs-home-panel, .ag-cs-home-panel-seat, .ag-cs-ripple-layer, .ag-cs-ripple-host, .ag-cs-conv-aura-host, .ag-cs-crab, .ag-cs-mascot, .ag-v2-mascot-stage, .ag-cs-crystal-bar, [data-testid="orchestrator-effort-bar"], .ag-cs-prism-rim-cv, .ag-cs-code-fold-btn, .ag-cs-nav-outline-popover, .ag-cs-smooth-caret, .ag-cs-perf-backdrop'
+    ', #ag-prism-host-alert-css, #ag-prism-settings-v101-css, #ag-prism-omni-css, #ag-prism-sidebar-studio-css, #ag-cs-settings-sec, .ag-omni-dock, .ag-omni-menu, .ag-prism-omni-menu, .ag-prism-omni-pane, [data-ag-prism-omni-owned="1"], [data-ag-prism-sidebar-owned="1"], .ag-prism-sidebar-studio, .ag-prism-sidebar-rail, .ag-prism-sidebar-popover, .ag-prism-sidebar-modal, .ag-cs-home-panel, .ag-cs-home-panel-seat, .ag-cs-ripple-layer, .ag-cs-ripple-host, .ag-cs-conv-aura-host, .ag-cs-crab, .ag-cs-mascot, .ag-v2-mascot-stage, .ag-cs-crystal-bar, [data-testid="orchestrator-effort-bar"], .ag-cs-prism-rim-cv, .ag-cs-code-fold-btn, .ag-cs-nav-outline-popover, .ag-cs-smooth-caret, .ag-cs-perf-backdrop'
   );
   nodes.forEach((n) => n.remove());
   return { removed: nodes.length };
@@ -5756,6 +6311,7 @@ module.exports = {
   SETTING_BINDING,
   LEGACY_SETTING_BINDING,
   OMNI_BINDING,
+  SIDEBAR_BINDING,
   PORT_FILE,
   PID_FILE,
   CONFIG_FILE,
@@ -5794,6 +6350,7 @@ module.exports = {
   getBrowserWsUrl,
   CdpSession,
   minifyCss,
+  minifyGlsl,
   minifyJs,
   stripJsFunctionsByName,
   prepareRuntimePart,
@@ -5801,4 +6358,6 @@ module.exports = {
   buildConfigRefreshExpression,
   buildInjectExpression,
   buildOmniClientExpression,
+  buildSidebarStudioExpression,
+  isSafeV2SidebarClientSource,
 };

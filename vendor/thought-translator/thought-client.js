@@ -1,4 +1,4 @@
-// Obsidian Prism — Unified Thought Translator & Polisher Client Runtime (v1.0.1 Upgraded)
+// Obsidian Prism — Unified Thought Translator & Polisher Client Runtime (v1.0.2 Upgraded)
 // Incorporates proven anti-jank & anti-retranslate safeguards + v1.0.1 workbench capabilities:
 // 1. Rendered-signature idempotence (`data-op-zh-sig` + `data-raw-zh`) -> 0 redundant DOM rebuilds on cache hit;
 // 2. Global `inflightBySig` flight pool across React panel remounts + pre-commit source-hash verification -> 0 duplicate requests & 0 misplacement;
@@ -405,11 +405,6 @@
       h = Math.imul(h, 16777619);
     }
     return `_v3_${(h >>> 0).toString(36)}_${skel.length}`;
-  }
-
-  function hashKey(rawText, prefix) {
-    const b = computeSkelBody(normalizeTextKey(rawText));
-    return b ? `${prefix}${b}` : '';
   }
 
   function isMostlyZhNorm(norm) {
@@ -1842,7 +1837,6 @@
   }
 
   const sigFromBody = (kb, mode) => `${mode === 'machine' ? 'mt' : activeStyleTag || 'ai_pending'}:sig${kb}`;
-  const computeSig = (rawText, mode) => sigFromBody(computeSkelBody(normalizeTextKey(rawText)), mode);
 
   function findCachedByBody(kb, mode) {
     if (!kb) return '';

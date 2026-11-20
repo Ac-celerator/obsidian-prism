@@ -940,3 +940,663 @@ test('perf guard 16: smooth-caret avoids sel.isCollapsed forced layout, prism-ri
   assert.ok(scSrc.includes("ha(ov, 'data-hover-card-popup')"), 'stream-choreography must skip hover cards in measureNewLensOverlays');
   assert.ok(uiSrc.includes("'data-hover-card-popup'"), 'ui-runtime must short-circuit hover cards in classifyDirtySubtree');
 });
+
+test('perf guard 17: pulse-dashboard keep-alive agent & includeMessages:false, bounded daemon RAM budgets, and lazy sidebar/telemetry release', async () => {
+  const http = await import('node:http');
+  const { AntigravityClient } = await import('../vendor/pulse-dashboard/sidecars/panel/client.mjs');
+  const { PrismDaemon } = await import('../sidecars/daemon/main.mjs');
+
+  // 1) client.mjs must never disable HTTP pooling via agent:false and must default includeMessages:false
+  const clientSrc = fs.readFileSync(path.join(ROOT, 'vendor/pulse-dashboard/sidecars/panel/client.mjs'), 'utf8');
+  assert.equal(/agent:\s*false/.test(clientSrc), false, 'client.mjs must reuse keep-alive HttpAgent instead of agent:false');
+
+  let receivedBody = null;
+  let receivedConn = '';
+  const srv = http.createServer((req, res) => {
+    receivedConn = String(req.headers.connection || '');
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      receivedBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ generatorMetadata: [] }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const client = new AntigravityClient();
+  try {
+    const port = srv.address().port;
+    assert.equal(client.agent?.keepAlive, true, 'AntigravityClient must use a keepAlive HttpAgent');
+    client.discover = async () => ({ port, csrf: 'test-csrf', pid: 1 });
+    await client.call('GetCascadeTrajectoryGeneratorMetadata', { cascadeId: '11111111-1111-1111-1111-111111111111', generatorMetadataOffset: 0 });
+    assert.equal(receivedBody.includeMessages, false, 'GetCascadeTrajectoryGeneratorMetadata must default includeMessages:false');
+    assert.equal(receivedConn.toLowerCase(), 'keep-alive', 'RPC request must use HTTP keep-alive');
+  } finally {
+    client.dispose();
+    await new Promise((r) => srv.close(r));
+  }
+
+  // 2) Verify tightened RAM / polling budgets across pulse-dashboard & thought-translator
+  const readerSrc = fs.readFileSync(path.join(ROOT, 'vendor/pulse-dashboard/sidecars/panel/trajectory-reader.mjs'), 'utf8');
+  const storeSrc = fs.readFileSync(path.join(ROOT, 'vendor/pulse-dashboard/sidecars/panel/store.mjs'), 'utf8');
+  const delSrc = fs.readFileSync(path.join(ROOT, 'vendor/pulse-dashboard/sidecars/panel/delegated-usage.mjs'), 'utf8');
+  const bgStatSrc = fs.readFileSync(path.join(ROOT, 'vendor/pulse-dashboard/sidecars/panel/background-statistics.mjs'), 'utf8');
+  const bgWorkSrc = fs.readFileSync(path.join(ROOT, 'vendor/pulse-dashboard/sidecars/panel/background-worker.mjs'), 'utf8');
+  const usageSrc = fs.readFileSync(path.join(ROOT, 'vendor/pulse-dashboard/sidecars/panel/usage.mjs'), 'utf8');
+  const thoughtSrc = fs.readFileSync(path.join(ROOT, 'vendor/thought-translator/translator-service.mjs'), 'utf8');
+  const mainSrc = fs.readFileSync(path.join(ROOT, 'sidecars/daemon/main.mjs'), 'utf8');
+
+  assert.ok(readerSrc.includes('budgetBytes=4*1024*1024') && readerSrc.includes('summaryAt>=6000') && readerSrc.includes('trajectoryVerbosity:2'), 'trajectory-reader must use 4 MiB budget, 6s summary TTL, and compact trajectoryVerbosity:2');
+  assert.ok(storeSrc.includes('updatedAt < 4500') && storeSrc.includes('this.sessions.size > 32'), 'store must use 4.5s hot TTL and 32-session cap');
+  assert.ok(delSrc.includes('budgetBytes=2*1024*1024') && delSrc.includes('refreshMs=15000'), 'delegated-usage must use 2 MiB budget and 15s refresh');
+  assert.ok(bgStatSrc.includes('maxOldGenerationSizeMb:48'), 'background-statistics worker V8 cap must be 48 MB');
+  assert.ok(bgWorkSrc.includes('++revisions>1') && bgWorkSrc.includes('sleep(8000)') && bgWorkSrc.includes('trajectoryVerbosity:2'), 'background-worker must cap active-session restarts to 1 with 8s backoff and verbosity 2');
+  assert.ok(usageSrc.includes('maxOldGenerationSizeMb:32') && usageSrc.includes('livePollMs=3000') && usageSrc.includes('maxCandidates=10'), 'usage worker V8 cap must be 32 MB, live poll 3s, and maxCandidates 10');
+  assert.ok(thoughtSrc.includes('opts.maxCacheEntries || 400'), 'thought-translator in-memory cache default must be capped at 400');
+  assert.equal((mainSrc.match(/includeMessages:\s*false/g) || []).length >= 2, true, 'main.mjs generator metadata calls must pass includeMessages:false');
+
+  // 2b) TrajectoryJson zero-allocation discard fast-path preserves strict JSON validation
+  const { TrajectoryJson } = await import('../vendor/pulse-dashboard/sidecars/panel/trajectory-json.mjs');
+  const tj = new TrajectoryJson();
+  tj.write('{"steps":[{"type":"PLANNER_RESPONSE","hugeDroppedBlob":"abc\\n\\u0041\\"def\\\\ghi","metadata":{"startedAt":"2026-11-20T00:00:00Z"}}]}');
+  const parsedTj = tj.end();
+  assert.equal(parsedTj.steps[0].type, 'PLANNER_RESPONSE');
+  assert.equal(parsedTj.steps[0].hugeDroppedBlob, undefined);
+  assert.equal(parsedTj.steps[0].metadata.startedAt, '2026-11-20T00:00:00Z');
+  assert.throws(() => {
+    const bad = new TrajectoryJson();
+    bad.write('{"steps":[{"hugeDroppedBlob":"bad\nnewline"}]}');
+  }, 'discard fast-path must still reject unescaped control chars');
+  assert.throws(() => {
+    const bad2 = new TrajectoryJson();
+    bad2.write('{"steps":[{"hugeDroppedBlob":"bad\\x20escape"}]}');
+  }, 'discard fast-path must still reject invalid escape sequences');
+  assert.throws(() => {
+    const bad3 = new TrajectoryJson();
+    bad3.write('{"steps":[{"hugeDroppedBlob":"bad\\u123Z"}]}');
+  }, 'discard fast-path must still reject invalid unicode escapes');
+
+  // 3) PrismDaemon skips compiling 284KB sidebar-client.js when sidebarStudio is off and releases idle telemetry
+  const daemon = Object.create(PrismDaemon.prototype);
+  daemon.rootDir = ROOT;
+  daemon._readCdpFileSig = () => null;
+  let sidebarBuildCalls = 0;
+  daemon.cdp = {
+    readConfig: () => ({ sidebarStudio: 'off', telemetryModule: 'off' }),
+    buildInjectExpression: () => 'main',
+    buildSidebarStudioExpression: () => { sidebarBuildCalls++; return 'sb'; },
+  };
+  daemon.rebuildBundle();
+  assert.equal(sidebarBuildCalls, 0, 'rebuildBundle must skip compiling sidebar-client.js when sidebarStudio is off');
+  assert.equal(daemon.sidebarExpr, '');
+
+  let disposedCount = 0;
+  daemon._lazyStore = { dispose() { disposedCount++; }, client: { dispose() { disposedCount++; } } };
+  daemon._lazyUsage = { dispose() { disposedCount++; } };
+  daemon._lazyLsClient = daemon._lazyStore.client;
+  daemon._backendSummariesCache = { list: [], byId: new Map() };
+  daemon._lastTelemetryActivityAt = Date.now() - 200000;
+  assert.equal(daemon._releaseIdleTelemetry(false), true, 'idle telemetry must release after 120s inactivity');
+  assert.equal(disposedCount, 2, 'idle release must dispose usage & store once without double-disposing shared client');
+  assert.equal(daemon._lazyStore, null);
+  assert.equal(daemon._lazyUsage, null);
+  assert.equal(daemon._lazyLsClient, null);
+  assert.equal(daemon._backendSummariesCache, null);
+});
+
+test('perf guard 18: live-host-adapter bounds lastKnownById to <=2000 and sidebar-client parses host timestamps deterministically & skips no-op list rebuilds', async () => {
+  const { createLiveHostAdapter } = await import('../vendor/sidebar-studio/live-host-adapter.mjs');
+  const adapter = createLiveHostAdapter();
+  // Push 3 batches of 900 distinct conversations (2,700 total) and verify LRU cap <= 2000 while preserving active batch
+  for (let batch = 0; batch < 3; batch++) {
+    const items = [];
+    for (let i = 0; i < 900; i++) {
+      const id = `cid-${batch}-${i}`;
+      items.push({ cascadeId: id, title: `Chat ${id}`, status: 'idle', updatedAt: batch * 10000 + i + 1 });
+    }
+    adapter.syncFromRenderer({ catalog: { health: 'ready', items } });
+  }
+  const snap = adapter.getCatalog();
+  const keys = Object.keys(snap.lastKnownById);
+  assert.ok(keys.length <= 2000, `lastKnownById must be bounded to <=2000, got ${keys.length}`);
+  assert.ok(snap.lastKnownById['cid-2-899'], 'newest active batch items must always be retained');
+  assert.equal(snap.lastKnownById['cid-0-0'], undefined, 'oldest stale entries must be evicted beyond 2000 cap');
+
+  // Verify sidebar-client.js parseHostTsMs handles ISO strings, protobuf {seconds, nanos}, numbers, and missing values without Date.now()/NaN
+  const sbSrc = fs.readFileSync(path.join(ROOT, 'vendor/sidebar-studio/sidebar-client.js'), 'utf8');
+  const parseMatch = sbSrc.match(/function parseHostTsMs\(raw\)[\s\S]*?\n    \}/);
+  assert.ok(parseMatch, 'parseHostTsMs helper must exist in sidebar-client.js');
+  const sbTs = { Number, Math, Date };
+  vm.runInNewContext(`${parseMatch[0]}; globalThis.parseHostTsMs = parseHostTsMs;`, sbTs);
+  assert.equal(sbTs.parseHostTsMs('2026-11-20T08:00:00Z'), Date.parse('2026-11-20T08:00:00Z'));
+  assert.equal(sbTs.parseHostTsMs({ seconds: 1700000000, nanos: 500000000 }), 1700000000500);
+  assert.equal(sbTs.parseHostTsMs(1700000000), 1700000000000);
+  assert.equal(sbTs.parseHostTsMs(1700000000123), 1700000000123);
+  assert.equal(sbTs.parseHostTsMs(undefined), 0, 'missing timestamp must return deterministic 0, never Date.now() or NaN');
+  assert.equal(sbTs.parseHostTsMs('not-a-date'), 0);
+
+  assert.ok(sbSrc.includes('document.hidden') && sbSrc.includes('? 60 : 280'), 'scheduleCatalogSync must skip hidden tabs and throttle steady-state sync to 280ms');
+  assert.ok(sbSrc.includes('cachedSidebarSlots') && sbSrc.includes('invalidateSidebarSlotsCache'), 'resolveNativeSidebarSlots must cache slot geometry');
+  assert.ok(sbSrc.includes('buildChatListRenderSig') && sbSrc.includes('renderSig === lastChatListRenderSig'), 'renderChatSidebarList must skip redundant DOM teardowns');
+});
+
+test('perf guard 19: conversation-archive safely moves finished subagent DB+WAL+SHM bundles, refuses while language_server runs, restores losslessly, and keeps default bundle < 670 KiB', async () => {
+  const os = await import('node:os');
+  const arch = await import('../sidecars/daemon/conversation-archive.mjs');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-prism-arch-'));
+  try {
+    const convDir = path.join(tmpRoot, 'conversations');
+    const archiveDir = path.join(tmpRoot, 'conversations_archive');
+    fs.mkdirSync(convDir, { recursive: true });
+
+    const subOldId = '11111111-1111-4111-8111-111111111111';
+    const subRunningId = '22222222-2222-4222-8222-222222222222';
+    const mainId = '33333333-3333-4333-8333-333333333333';
+    const oldTime = new Date(Date.now() - 12 * 3600000);
+
+    for (const [fn, content] of [
+      [`${subOldId}.db`, 'sub-old-db-bytes'],
+      [`${subOldId}.db-wal`, 'sub-old-wal'],
+      [`${subOldId}.db-shm`, 'sub-old-shm'],
+      [`${subRunningId}.db`, 'sub-running-db'],
+      [`${mainId}.db`, 'main-db-precious'],
+    ]) {
+      const fp = path.join(convDir, fn);
+      fs.writeFileSync(fp, content, 'utf8');
+      fs.utimesSync(fp, oldTime, oldTime);
+    }
+
+    // 1) Fail-closed without catalog index
+    const noIdx = arch.archiveConversations({ convDir, archiveDir, checkRunning: () => false });
+    assert.equal(noIdx.ok, false);
+    assert.equal(noIdx.code, 'NO_CATALOG_INDEX');
+
+    // 2) Save catalog index with authoritative lastModifiedTime (even if .db-shm was just touched on startup)
+    fs.utimesSync(path.join(convDir, `${subOldId}.db-shm`), new Date(), new Date());
+    arch.saveCatalogIndex(archiveDir, {
+      [subOldId]: {
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        stepCount: 120,
+        lastModifiedTime: oldTime.toISOString(),
+        trajectoryMetadata: { parentConversationId: mainId },
+      },
+      [subRunningId]: { status: 'CASCADE_RUN_STATUS_RUNNING', stepCount: 5, trajectoryMetadata: { parentConversationId: mainId } },
+      [mainId]: { summary: 'Main Task', status: 'CASCADE_RUN_STATUS_IDLE', stepCount: 300, trajectoryMetadata: {} },
+    });
+    const scan = arch.scanConversationStorage({ convDir, archiveDir, subagentMaxAgeHours: 6 });
+    assert.equal(scan.mainCount, 1);
+    assert.equal(scan.subagentCount, 2);
+    assert.equal(scan.archivableSubagentCount, 1, 'only finished subagent exceeding age threshold is archivable');
+
+    // 3) Must refuse to move files while language_server is running
+    const blocked = arch.archiveConversations({ convDir, archiveDir, subagentMaxAgeHours: 6, checkRunning: () => true });
+    assert.equal(blocked.ok, false);
+    assert.equal(blocked.code, 'LANGUAGE_SERVER_RUNNING');
+    assert.equal(fs.existsSync(path.join(convDir, `${subOldId}.db`)), true);
+
+    // 4) Archive cleanly when language_server is stopped: moves db+wal+shm atomically, preserves main & running subagent
+    const moved = arch.archiveConversations({ convDir, archiveDir, subagentMaxAgeHours: 6, checkRunning: () => false });
+    assert.equal(moved.ok, true);
+    assert.equal(moved.movedCount, 1);
+    assert.equal(fs.existsSync(path.join(convDir, `${subOldId}.db`)), false);
+    assert.equal(fs.existsSync(path.join(convDir, `${subOldId}.db-wal`)), false);
+    assert.equal(fs.existsSync(path.join(convDir, `${subOldId}.db-shm`)), false);
+    assert.equal(fs.existsSync(path.join(convDir, `${mainId}.db`)), true, 'main conversation must never be moved in subagents mode');
+    assert.equal(fs.existsSync(path.join(convDir, `${subRunningId}.db`)), true, 'running subagent must never be moved');
+    assert.equal(fs.existsSync(path.join(moved.batchDir, 'manifest.json')), true);
+
+    // 5) Restore losslessly
+    const restored = arch.restoreArchiveBatch({ convDir, archiveDir, batchName: 'latest', checkRunning: () => false });
+    assert.equal(restored.ok, true);
+    assert.equal(restored.restoredCount, 1);
+    assert.equal(fs.readFileSync(path.join(convDir, `${subOldId}.db`), 'utf8'), 'sub-old-db-bytes');
+    assert.equal(fs.readFileSync(path.join(convDir, `${subOldId}.db-wal`), 'utf8'), 'sub-old-wal');
+    assert.equal(fs.readFileSync(path.join(convDir, `${subOldId}.db-shm`), 'utf8'), 'sub-old-shm');
+
+    // 5b) Crash recovery: batch directory missing manifest.json is still discovered & restorable
+    const orphanBatch = path.join(archiveDir, 'batch-2026-11-20T00-00-00-deadbeef');
+    fs.mkdirSync(orphanBatch, { recursive: true });
+    const orphanId = '44444444-4444-4444-8444-444444444444';
+    fs.writeFileSync(path.join(orphanBatch, `${orphanId}.db`), 'orphan-crash-db', 'utf8');
+    const batches = arch.listArchiveBatches(archiveDir);
+    assert.ok(batches.some((b) => b.batchName === 'batch-2026-11-20T00-00-00-deadbeef' && b.status === 'recovered-no-manifest'));
+    const recRes = arch.restoreArchiveBatch({ convDir, archiveDir, batchName: 'batch-2026-11-20T00-00-00-deadbeef', checkRunning: () => false });
+    assert.equal(recRes.ok, true);
+    assert.equal(recRes.restoredCount, 1);
+    assert.equal(fs.readFileSync(path.join(convDir, `${orphanId}.db`), 'utf8'), 'orphan-crash-db');
+
+    // 6) Helper scripts generation, fail-closed checkRunning error & shell injection rejection
+    const checkErrBlocked = arch.archiveConversations({
+      convDir,
+      archiveDir,
+      subagentMaxAgeHours: 6,
+      checkRunning: () => { throw new Error('tasklist unavailable'); },
+    });
+    assert.equal(checkErrBlocked.ok, false);
+    assert.equal(checkErrBlocked.code, 'LANGUAGE_SERVER_RUNNING', 'checkRunning throwing must fail-closed');
+    assert.throws(() => {
+      arch.writeHelperScripts({ scriptPath: 'C:\\bad&calc\\script.mjs', archiveDir });
+    }, 'writeHelperScripts must reject shell metacharacters');
+    const helpers = arch.writeHelperScripts({
+      scriptPath: path.join(ROOT, 'sidecars', 'daemon', 'conversation-archive.mjs'),
+      archiveDir,
+    });
+    assert.ok(fs.existsSync(helpers.archiveScriptPath) && fs.existsSync(helpers.restoreScriptPath));
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('perf guard 20: Host Turbo alert.css dedup+restore, async img, hidden sidecar iframe skip, blur 1.2s pause / 0ms wake, idle fxCanvas 0x0 reclamation, and bundle < 670 KiB', () => {
+  const cdp = require(path.join(ROOT, 'cdp.js'));
+  const enhancerMod = require(path.join(ROOT, 'host-workbench-enhancer.js'));
+  const rig = require(path.join(ROOT, 'dual-mascot-rig.js'));
+
+  // 1) Hard size budget: default bundle < 670 KiB (686,080 B) & pulse-vial-bridge.js < 31,000 B
+  const defaultExpr = cdp.buildInjectExpression(cdp.DEFAULT_CONFIG);
+  const bundleBytes = Buffer.byteLength(defaultExpr, 'utf8');
+  assert.ok(bundleBytes < 670 * 1024, `Default bundle must stay < 670 KiB (686080 B), got ${bundleBytes} B`);
+  const pvBytes = fs.statSync(path.join(ROOT, 'pulse-vial-bridge.js')).size;
+  assert.ok(pvBytes < 31000, `pulse-vial-bridge.js must stay < 31000 B, got ${pvBytes} B`);
+
+  // 2) CSS guards (T2/T3/T4/T5): hidden dot animation:none, valid blur pause (no pseudo-elements inside :is()), iframe contain:strict, safe pre/table contain
+  const css = fs.readFileSync(path.join(ROOT, 'style.css'), 'utf8');
+  assert.ok(
+    css.includes('[data-agent-state-dot]:nth-child(n+2){display:none !important;animation:none !important;}'),
+    'Hidden status spinner dots must clear native animation'
+  );
+  assert.ok(css.includes('iframe[src^="plugin://"]{contain:strict;'), 'plugin:// sidecar iframes must have contain:strict');
+  assert.ok(
+    css.includes('pre:not([data-ag-cs-rich-pre="1"]),pre>div:is(.border,.bg-muted)>div:nth-child(2),.agy-md-table.md-table-frame,table:not(.md-table-el)){contain:layout style;}'),
+    'Read-only code bodies and Markdown tables must have safe contain:layout style without contain:paint'
+  );
+  const blurRuleMatch = css.match(/html\[data-ag-cs-style\]\[data-ag-cs-win-blur="1"\]\{[^\n]+\}/);
+  assert.ok(blurRuleMatch, 'style.css must define window-blur animation pause rule');
+  assert.ok(
+    blurRuleMatch[0].includes('animation-play-state:paused !important;') &&
+      blurRuleMatch[0].includes('[data-testid="status-loading-spinner"]::before') &&
+      blurRuleMatch[0].includes('.shimmer-text-mask') &&
+      blurRuleMatch[0].includes('.shimmer-text-content'),
+    'Window-blur rule must pause spinner, dot, and shimmer animations'
+  );
+  assert.equal(/:is\([^)]*::(?:before|after)/.test(blurRuleMatch[0]), false, 'Pseudo-elements must never be placed inside :is()');
+
+  // 3) Live runtime test for T1 (alert.css dedup + lossless restore without removing React nodes), T2 (async img), and T5 (1.2s blur / 0ms focus wake)
+  const uiSrc = fs.readFileSync(path.join(ROOT, 'ui-runtime.js'), 'utf8');
+  function mkEl(tag, attrs = {}) {
+    const attrMap = new Map(Object.entries(attrs));
+    const el = {
+      nodeType: 1,
+      tagName: String(tag).toUpperCase(),
+      parentElement: null,
+      parentNode: null,
+      children: [],
+      childNodes: [],
+      isConnected: true,
+      disabled: false,
+      sheet: tag === 'style' ? { disabled: false } : undefined,
+      style: { setProperty() {}, removeProperty() {} },
+      textContent: '',
+      get id() { return attrMap.get('id') || ''; },
+      set id(v) { if (v) attrMap.set('id', String(v)); else attrMap.delete('id'); },
+      get className() { return attrMap.get('class') || ''; },
+      set className(v) { if (v) attrMap.set('class', String(v)); else attrMap.delete('class'); },
+      classList: { add() {}, remove() {}, contains: () => false },
+      getAttribute: (k) => (attrMap.has(k) ? attrMap.get(k) : null),
+      setAttribute: (k, v) => attrMap.set(k, String(v)),
+      hasAttribute: (k) => attrMap.has(k),
+      removeAttribute: (k) => attrMap.delete(k),
+      appendChild(ch) {
+        ch.parentElement = this;
+        ch.parentNode = this;
+        this.children.push(ch);
+        this.childNodes.push(ch);
+        return ch;
+      },
+      remove() {
+        const p = this.parentNode;
+        if (!p) return;
+        const i = p.children.indexOf(this);
+        if (i >= 0) p.children.splice(i, 1);
+        const j = p.childNodes.indexOf(this);
+        if (j >= 0) p.childNodes.splice(j, 1);
+        this.parentElement = null;
+        this.parentNode = null;
+        this.isConnected = false;
+      },
+      closest(sel) {
+        let cur = this;
+        while (cur) {
+          if (sel === '[data-prism-ignore]' && cur.hasAttribute('data-prism-ignore')) return cur;
+          cur = cur.parentElement;
+        }
+        return null;
+      },
+      contains(o) {
+        let cur = o;
+        while (cur) {
+          if (cur === this) return true;
+          cur = cur.parentNode;
+        }
+        return false;
+      },
+      querySelectorAll(sel) {
+        const out = [];
+        const walk = (n) => {
+          for (const c of n.children) {
+            let hit = false;
+            if (sel === 'style:not([id]):not([data-ag-turbo-dedup])') {
+              hit = c.tagName === 'STYLE' && !c.id && !c.hasAttribute('data-ag-turbo-dedup');
+            } else if (sel === 'img:not([data-ag-turbo-img])') {
+              hit = c.tagName === 'IMG' && !c.hasAttribute('data-ag-turbo-img');
+            } else if (sel === 'style[data-ag-turbo-dedup]') {
+              hit = c.tagName === 'STYLE' && c.hasAttribute('data-ag-turbo-dedup');
+            } else if (sel === 'img[data-ag-turbo-img]') {
+              hit = c.tagName === 'IMG' && c.hasAttribute('data-ag-turbo-img');
+            }
+            if (hit) out.push(c);
+            walk(c);
+          }
+        };
+        walk(this);
+        return out;
+      },
+      querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    return el;
+  }
+
+  const html = mkEl('html');
+  const head = mkEl('head');
+  const body = mkEl('body');
+  html.appendChild(head);
+  html.appendChild(body);
+
+  const bubble = mkEl('div');
+  body.appendChild(bubble);
+  const alertCss = '/* Copied from remark-github-blockquote-alert/alert.css */\n.markdown-alert{padding:8px;}';
+  const dupStyles = [mkEl('style'), mkEl('style'), mkEl('style')];
+  for (const s of dupStyles) { s.textContent = alertCss; bubble.appendChild(s); }
+  const keepStyle = mkEl('style', { id: 'keep-style' });
+  keepStyle.textContent = alertCss;
+  head.appendChild(keepStyle);
+
+  const imgNormal = mkEl('img', { src: 'icon.svg' });
+  const imgIgnored = mkEl('img', { src: 'raw.png', 'data-prism-ignore': '1' });
+  bubble.appendChild(imgNormal);
+  bubble.appendChild(imgIgnored);
+
+  const winListeners = new Map();
+  const docListeners = new Map();
+  const timers = new Map();
+  let nextTid = 1;
+  let hasFocusVal = true;
+
+  const doc = {
+    documentElement: html,
+    head,
+    body,
+    hidden: false,
+    hasFocus: () => hasFocusVal,
+    createElement: (t) => mkEl(t),
+    getElementById(id) {
+      const find = (n) => {
+        if (n.id === id) return n;
+        for (const c of n.children) { const r = find(c); if (r) return r; }
+        return null;
+      };
+      return find(html);
+    },
+    querySelectorAll: (sel) => html.querySelectorAll(sel),
+    querySelector: (sel) => html.querySelector(sel),
+    addEventListener(type, fn) {
+      if (!docListeners.has(type)) docListeners.set(type, new Set());
+      docListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) { docListeners.get(type)?.delete(fn); },
+  };
+  const win = {
+    location: { pathname: '/chat' },
+    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+    getComputedStyle: () => ({ getPropertyValue: () => '' }),
+    addEventListener(type, fn) {
+      if (!winListeners.has(type)) winListeners.set(type, new Set());
+      winListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) { winListeners.get(type)?.delete(fn); },
+    dispatch(type, ev = {}) {
+      for (const fn of Array.from(winListeners.get(type) || [])) fn(ev);
+    },
+  };
+  class MockMO {
+    observe() {}
+    disconnect() {}
+    takeRecords() { return []; }
+  }
+  const sbUi = {
+    window: win,
+    document: doc,
+    location: win.location,
+    localStorage: win.localStorage,
+    MutationObserver: MockMO,
+    performance: { now: () => 1000 },
+    setTimeout: (fn, ms) => { const id = nextTid++; timers.set(id, { fn, ms }); return id; },
+    clearTimeout: (id) => { timers.delete(id); },
+    setInterval: () => 9999,
+    clearInterval: () => {},
+    requestAnimationFrame: (fn) => { const id = nextTid++; timers.set(id, { fn, ms: 16 }); return id; },
+    cancelAnimationFrame: (id) => { timers.delete(id); },
+    console,
+    Set, Map, WeakMap, WeakSet, Array, Object, Math, Number, String, Boolean, Date, RegExp, JSON,
+  };
+  sbUi.globalThis = sbUi;
+  vm.runInNewContext(uiSrc, sbUi);
+  sbUi.__agCsUiMain({}, { version: '1.0.2', codeHash: 'test' });
+
+  // Verify T1: 1 singleton hoisted in head, all 3 duplicate bubble styles kept in React DOM but disabled=true
+  const singleton = doc.getElementById('ag-prism-host-alert-css');
+  assert.ok(singleton && singleton.parentNode === head, 'Singleton alert.css style must be hoisted into <head>');
+  assert.equal(singleton.textContent, alertCss);
+  for (const s of dupStyles) {
+    assert.equal(s.parentNode, bubble, 'Duplicate <style> must NEVER be removed from React DOM tree');
+    assert.equal(s.disabled, true, 'Duplicate <style> must be disabled=true');
+    assert.equal(s.sheet.disabled, true, 'Duplicate style.sheet must be disabled=true');
+    assert.equal(s.getAttribute('data-ag-turbo-dedup'), '1');
+  }
+  assert.equal(keepStyle.disabled, false, 'Styles with an id must never be deduplicated');
+
+  // Verify T2: <img> gets async decoding & lazy loading; data-prism-ignore is skipped
+  assert.equal(imgNormal.decoding, 'async');
+  assert.equal(imgNormal.getAttribute('decoding'), 'async');
+  assert.equal(imgNormal.getAttribute('loading'), 'lazy');
+  assert.equal(imgIgnored.getAttribute('decoding'), null, '[data-prism-ignore] images must be skipped');
+
+  // Verify T5: blur sets data-ag-cs-win-blur="1" after 1200ms debounce, focus wakes in 0ms
+  const fireBlurTimers = () => {
+    const entries = [...timers.entries()].filter(([, t]) => t.ms === 1200);
+    for (const [id, t] of entries) {
+      timers.delete(id);
+      t.fn();
+    }
+    return entries.length;
+  };
+  hasFocusVal = false;
+  win.dispatch('blur');
+  assert.equal(html.getAttribute('data-ag-cs-win-blur'), null, 'Must not blur-pause immediately before 1200ms debounce');
+  assert.equal(fireBlurTimers(), 1, 'Expected one 1200ms window blur debounce timer');
+  assert.equal(html.getAttribute('data-ag-cs-win-blur'), '1', 'Window blur > 1200ms must set data-ag-cs-win-blur="1"');
+
+  hasFocusVal = true;
+  win.dispatch('focus');
+  assert.equal(html.getAttribute('data-ag-cs-win-blur'), null, 'Window focus must clear data-ag-cs-win-blur in 0ms');
+
+  // Blur cancelled by quick focus before 1200ms must leave no pending timer
+  hasFocusVal = false;
+  win.dispatch('blur');
+  win.dispatch('focus');
+  assert.equal([...timers.values()].filter((t) => t.ms === 1200).length, 0, 'Focus before 1200ms must cancel pending blur timer');
+
+  // Pointer passing over an unfocused window wakes in 0ms and re-arms 1200ms sleep if still unfocused
+  hasFocusVal = false;
+  win.dispatch('blur');
+  fireBlurTimers();
+  assert.equal(html.getAttribute('data-ag-cs-win-blur'), '1');
+  win.dispatch('pointermove', { clientX: 10, clientY: 10 });
+  assert.equal(html.getAttribute('data-ag-cs-win-blur'), null, 'pointermove must wake blur immediately in 0ms');
+  assert.equal([...timers.values()].filter((t) => t.ms === 1200).length, 1, 'unfocused pointermove wake must re-arm 1200ms blur timer');
+  fireBlurTimers();
+  assert.equal(html.getAttribute('data-ag-cs-win-blur'), '1', 're-armed blur timer must return unfocused window to low-power pause');
+
+  // Verify initial-blur boot: if window is already unfocused on mount, onWinBlur arms automatically
+  assert.ok(uiSrc.includes("if (typeof document.hasFocus === 'function' && !document.hasFocus()) onWinBlur();"), 'startLifecycle must arm blur timer when mounted while already unfocused');
+
+  // Verify destroy() restores 100% of deduped styles and removes singleton & blur listeners
+  hasFocusVal = false;
+  win.dispatch('blur');
+  fireBlurTimers();
+  assert.equal(html.getAttribute('data-ag-cs-win-blur'), '1');
+  win.__agPrism.destroy();
+  assert.equal(doc.getElementById('ag-prism-host-alert-css'), null, 'destroy() must remove singleton alert.css');
+  for (const s of dupStyles) {
+    assert.equal(s.disabled, false, 'destroy() must restore duplicate <style> disabled=false');
+    assert.equal(s.sheet.disabled, false);
+    assert.equal(s.hasAttribute('data-ag-turbo-dedup'), false);
+  }
+  assert.equal(html.hasAttribute('data-ag-cs-win-blur'), false, 'destroy() must remove data-ag-cs-win-blur');
+  assert.equal((winListeners.get('blur') || new Set()).size, 0, 'destroy() must unbind window blur listener');
+  assert.equal((winListeners.get('focus') || new Set()).size, 0, 'destroy() must unbind window focus listener');
+
+  // 4) T3: Hidden 0x0 sidecar iframe skips theme sampling & postMessage, then hydrates immediately on ResizeObserver reveal
+  let roCallback = null;
+  let hiddenRect = { left: 0, top: 0, width: 0, height: 0, right: 0, bottom: 0 };
+  const hiddenMsgs = [];
+  const hiddenIframe = mkEl('iframe', { 'data-testid': 'sidecar-iframe', src: 'plugin://swarm--swarm_board/' });
+  hiddenIframe.getBoundingClientRect = () => ({ ...hiddenRect });
+  hiddenIframe.contentWindow = { postMessage: (msg) => hiddenMsgs.push(msg) };
+  const enhHtml = mkEl('html', { 'data-ag-cs-style': '1', 'data-ag-cs-theme': 'dark', 'data-ag-cs-palette': 'obsidian' });
+  const enhBody = mkEl('body');
+  enhHtml.appendChild(enhBody);
+  enhBody.appendChild(hiddenIframe);
+  const enhDoc = {
+    documentElement: enhHtml,
+    body: enhBody,
+    querySelectorAll: (sel) => (sel.includes('sidecar-iframe') ? [hiddenIframe] : []),
+    querySelector: () => null,
+  };
+  const enhWin = {
+    innerHeight: 900,
+    getComputedStyle: () => ({ getPropertyValue: (k) => (k === '--background' ? '#0B0B0E' : k === 'color-scheme' ? 'dark' : '') }),
+    ResizeObserver: class {
+      constructor(cb) { roCallback = cb; }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const enhCtl = enhancerMod.createHostEnhancerController({ doc: enhDoc, win: enhWin, getLang: () => 'zh-CN' });
+  enhCtl.sync();
+  assert.equal(hiddenMsgs.length, 0, 'Hidden 0x0 sidecar iframe must receive 0 postMessages');
+  assert.equal(enhCtl.getDebugState().themeSampleCount, 0, 'All-hidden sidecar iframes must skip getComputedStyle');
+
+  hiddenRect = { left: 0, top: 0, width: 480, height: 700, right: 480, bottom: 700 };
+  assert.equal(typeof roCallback, 'function', 'Host enhancer must attach ResizeObserver to sidecar iframes');
+  roCallback([{ target: hiddenIframe, contentRect: { width: 480, height: 700 } }]);
+  assert.equal(hiddenMsgs.length, 1, 'Revealing hidden sidecar iframe must push theme-change immediately');
+  enhCtl.destroy();
+
+  // 5) T6: dual-mascot-rig fxCanvas starts 0x0 (display:none), allocates during chromaResonance sparks, and shrinks back to 0x0
+  const hostChildren = [];
+  const makeRigEl = (tag) => {
+    const el = {
+      tagName: String(tag).toUpperCase(),
+      className: '',
+      width: 300,
+      height: 150,
+      clientWidth: 640,
+      style: { display: '', width: '', height: '', transform: '' },
+      children: [],
+      dataset: {},
+      setAttribute() {},
+      getAttribute: () => null,
+      appendChild(ch) { this.children.push(ch); ch.parentNode = this; return ch; },
+      remove() {},
+      addEventListener() {},
+      removeEventListener() {},
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 640, height: 48, right: 640, bottom: 48 }),
+      getContext: () => ({
+        save() {}, restore() {}, translate() {}, scale() {}, rotate() {}, drawImage() {},
+        setTransform() {}, clearRect() {}, fillRect() {},
+        imageSmoothingEnabled: false, fillStyle: '', globalAlpha: 1,
+      }),
+    };
+    return el;
+  };
+  const rigHost = makeRigEl('div');
+  rigHost.appendChild = (ch) => { hostChildren.push(ch); rigHost.children.push(ch); ch.parentNode = rigHost; return ch; };
+  const rigWin = {
+    devicePixelRatio: 1,
+    matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const rigDoc = {
+    hidden: false,
+    defaultView: rigWin,
+    createElement: (t) => { const e = makeRigEl(t); e.ownerDocument = rigDoc; return e; },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  rigHost.ownerDocument = rigDoc;
+  let rigTickFn = null;
+  const origSetInt = globalThis.setInterval;
+  const origClrInt = globalThis.clearInterval;
+  const origSetTo = globalThis.setTimeout;
+  const origClrTo = globalThis.clearTimeout;
+  globalThis.setInterval = (fn) => { rigTickFn = fn; return 1; };
+  globalThis.clearInterval = () => {};
+  globalThis.setTimeout = () => 1;
+  globalThis.clearTimeout = () => {};
+  const rigStage = rig.mountDualMascotStage(rigHost, {
+    miniPileEnabled: true,
+    reducedMotion: false,
+  });
+  try {
+    const fxCanvas = hostChildren.find((c) => c.className === 'ag-v2-chroma-fx');
+    assert.ok(fxCanvas, 'Expected ag-v2-chroma-fx canvas');
+    assert.equal(fxCanvas.width, 0, 'Idle fxCanvas must start with width=0 (no default 300x150 GPU texture)');
+    assert.equal(fxCanvas.height, 0, 'Idle fxCanvas must start with height=0');
+    assert.equal(fxCanvas.style.display, 'none', 'Idle fxCanvas must be display:none');
+
+    // Trigger 3-stage chromaResonance burst -> fxCanvas allocates dynamically
+    rigStage.stackOnto('cowboy', 'clawd');
+    rigStage.stackOnto('cat', 'cowboy');
+    rigStage.notify('model-shift');
+    rigStage.notify('code-copied');
+    for (let i = 0; i < 4; i++) rigStage.poke('cat');
+    assert.equal(rigStage.getLayoutSnapshot().chromaResonance.active, true);
+    assert.ok(typeof rigTickFn === 'function', 'Mascot heartbeat must be scheduled');
+    rigTickFn();
+    assert.ok(fxCanvas.width > 0 && fxCanvas.height > 0, 'Active chroma burst must allocate fxCanvas on demand');
+    assert.equal(fxCanvas.style.display, '', 'Active chroma burst must show fxCanvas');
+
+    // Toggle chromaResonance off and step ticks until trailing sparks fade -> fxCanvas reclaims back to 0x0 + display:none
+    for (let i = 0; i < 4; i++) rigStage.poke('cat');
+    assert.equal(rigStage.getLayoutSnapshot().chromaResonance.active, false);
+    for (let k = 0; k < 40; k++) rigTickFn();
+    assert.equal(rigStage.getLayoutSnapshot().chromaResonance.sparkCount, 0);
+    assert.equal(fxCanvas.width, 0, 'fxCanvas must reclaim to width=0 once sparks end');
+    assert.equal(fxCanvas.height, 0, 'fxCanvas must reclaim to height=0 once sparks end');
+    assert.equal(fxCanvas.style.display, 'none', 'fxCanvas must return to display:none once sparks end');
+  } finally {
+    rigStage.dispose();
+    globalThis.setInterval = origSetInt;
+    globalThis.clearInterval = origClrInt;
+    globalThis.setTimeout = origSetTo;
+    globalThis.clearTimeout = origClrTo;
+  }
+});

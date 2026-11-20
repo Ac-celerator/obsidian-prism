@@ -1,5 +1,5 @@
 // Obsidian Prism — Host Workbench Deep-Surface Enhancer (host-workbench-enhancer.js)
-// 1. Cross-origin zero-intrusion Sidecar UI (`plugin://*` Swarm / Model Hub / Pulse) 4-theme postMessage bridge (0fps idle).
+// 1. Cross-origin zero-intrusion Sidecar UI (`plugin://*` Swarm / Pulse) 4-theme postMessage bridge (0fps idle).
 // 2. Code block glass sticky header companion + manual [Fold (N lines)] / [Expand] toggle (>= 48 lines, scrollTop anchored, zero auto-fold).
 // 3. Long-conversation rail (`[data-testid="conversation-navigator"]`) hover outline popover (prompt filter, chapter delegation, fold historical steps) + Alt+Up/Down instant turn jump.
 
@@ -153,6 +153,7 @@
     let iframePushedSig = new WeakMap();
     const boundIframes = new WeakSet();
     const iframeUnsubscribers = [];
+    let iframeRo = null;
 
     const pruneUnsubs = (list, all, boundSet) => {
       for (let i = list.length - 1; i >= 0; i--) {
@@ -167,7 +168,6 @@
 
     const codeLineCache = new WeakMap();
     const preSyncCache = new WeakMap();
-    const boundFoldBtns = new WeakSet();
     let cachedConvView = null;
     let lastOutlineStreamSyncAt = 0;
 
@@ -309,9 +309,35 @@
       return cachedThemeSample;
     }
 
+    function resolveIframeTargetOrigin(iframe) {
+      const raw = String(iframe?.getAttribute?.('src') ?? iframe?.src ?? '').trim();
+      if (!raw) return null;
+      const low = raw.toLowerCase();
+      if (low.startsWith('plugin://') || low.startsWith('vscode-webview://')) return '*';
+      if (/^https?:\/\//i.test(raw)) {
+        const m = /^(https?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?)(?:[/?#]|$)/i.exec(raw);
+        if (!m) return null;
+        if (typeof URL === 'function') {
+          try {
+            const u = new URL(raw);
+            const h = u.hostname.toLowerCase();
+            return h === '127.0.0.1' || h === 'localhost' ? u.origin : null;
+          } catch {
+            return null;
+          }
+        }
+        return m[1].toLowerCase();
+      }
+      if (raw.startsWith('//') || raw.startsWith('\\') || /^[a-z][a-z0-9+.-]*:/i.test(raw)) return null;
+      const lo = win?.location?.origin;
+      return lo && /^https?:\/\//i.test(lo) ? lo : '*';
+    }
+
     function pushThemeToIframe(iframe, sample, force = false) {
       if (!iframe || !sample) return false;
       if (!force && iframePushedSig.get(iframe) === sample.sig) return false;
+      const targetOrigin = resolveIframeTargetOrigin(iframe);
+      if (!targetOrigin) return false;
       const cw = iframe.contentWindow;
       if (!cw || typeof cw.postMessage !== 'function') return false;
       try {
@@ -324,7 +350,7 @@
               cssVariables: { ...sample.vars },
             },
           },
-          '*'
+          targetOrigin
         );
         iframePushedSig.set(iframe, sample.sig);
         stats.postMessageCount += 1;
@@ -342,51 +368,61 @@
       return Array.from(set);
     }
 
+    function isIframeHidden(f) {
+      if (!f || f.hidden === true || f.getAttribute?.('aria-hidden') === 'true') return true;
+      const r = f.getBoundingClientRect?.();
+      return Boolean(r && r.width <= 0 && r.height <= 0);
+    }
+
+    function pushIfVis(f, force) {
+      if (isDead() || isIframeHidden(f)) return;
+      const s = sampleRootTheme(false);
+      if (s) pushThemeToIframe(f, s, force);
+    }
+
     function syncSidecarThemeBridge(forceSample = false) {
       if (isDead() || !doc) return;
       const iframes = querySidecarIframes();
-      if (iframes.length === 0) {
+      if (!iframes.length) {
         if (forceSample) sampleRootTheme(true);
         return;
       }
-
-      let needsSample = forceSample || !cachedThemeSample || cachedAttrKey !== readRootAttrKey();
-      if (!needsSample) {
-        for (let i = 0; i < iframes.length; i++) {
-          if (iframePushedSig.get(iframes[i]) !== cachedThemeSample.sig) {
-            needsSample = true;
-            break;
-          }
-        }
-      }
-
-      const sample = needsSample ? sampleRootTheme(forceSample) : cachedThemeSample;
-      if (!sample) return;
-
       pruneUnsubs(iframeUnsubscribers, false, boundIframes);
-
-      for (let i = 0; i < iframes.length; i++) {
-        const frame = iframes[i];
-        if (!boundIframes.has(frame) && typeof frame.addEventListener === 'function') {
+      if (!iframeRo && win?.ResizeObserver) {
+        iframeRo = new win.ResizeObserver((es) => {
+          for (const e of es || []) {
+            if (e?.contentRect && (e.contentRect.width > 0 || e.contentRect.height > 0)) pushIfVis(e.target, false);
+          }
+        });
+      }
+      const vis = [];
+      for (const frame of iframes) {
+        if (!boundIframes.has(frame) && frame.addEventListener) {
           boundIframes.add(frame);
-          const onFrameLoad = () => {
-            if (isDead()) return;
-            iframePushedSig.delete(frame);
-            const latest = sampleRootTheme(false) || sample;
-            pushThemeToIframe(frame, latest, true);
-          };
-          frame.addEventListener('load', onFrameLoad);
+          const onLoad = () => { iframePushedSig.delete(frame); pushIfVis(frame, true); };
+          frame.addEventListener('load', onLoad);
+          try { iframeRo?.observe?.(frame); } catch {}
           iframeUnsubscribers.push({
             el: frame,
             unsub: () => {
-              try {
-                frame.removeEventListener('load', onFrameLoad);
-              } catch {}
+              try { frame.removeEventListener('load', onLoad); } catch {}
+              try { iframeRo?.unobserve?.(frame); } catch {}
             },
           });
         }
-        pushThemeToIframe(frame, sample, false);
+        if (!isIframeHidden(frame)) vis.push(frame);
       }
+      if (!vis.length) {
+        if (forceSample) sampleRootTheme(true);
+        return;
+      }
+      const need =
+        forceSample ||
+        !cachedThemeSample ||
+        cachedAttrKey !== readRootAttrKey() ||
+        vis.some((f) => iframePushedSig.get(f) !== cachedThemeSample.sig);
+      const sample = need ? sampleRootTheme(forceSample) : cachedThemeSample;
+      if (sample) for (const f of vis) pushThemeToIframe(f, sample, false);
     }
 
     function refreshOutlineLocaleTexts() {
@@ -528,19 +564,25 @@
       runGuardedMut(() => {
         for (let i = 0; i < pres.length; i++) {
           const pre = pres[i];
-          const hasDirectDiv = Array.from(pre.children || []).some((ch) => String(ch?.tagName || '').toUpperCase() === 'DIV');
-          if (hasDirectDiv) setAttrIfChanged(pre, 'data-ag-cs-rich-pre', '1');
-          else if (pre.hasAttribute?.('data-ag-cs-rich-pre')) pre.removeAttribute('data-ag-cs-rich-pre');
           const prevRec = preSyncCache.get(pre);
-          if (
+          const recValid =
             prevRec &&
             pre !== streamingPre &&
             prevRec.lang === curLang &&
             prevRec.header?.getAttribute?.('data-ag-cs-code-sticky') === '1' &&
-            (prevRec.lineCount < MIN_CODE_FOLD_LINES || (prevRec.btn && prevRec.btn.isConnected !== false && prevRec.btn.parentElement)) &&
-            (prevRec.sealed || prevRec.stamp === getPreBodyStamp(prevRec.body))
-          ) {
-            if (!prevRec.sealed && lastResp && !lastResp.contains?.(pre) && !pre.closest?.('[data-testid="artifact-view"]')) {
+            (prevRec.lineCount < MIN_CODE_FOLD_LINES || (prevRec.btn && prevRec.btn.isConnected !== false && prevRec.btn.parentElement));
+          if (recValid && prevRec.sealed) continue;
+          let hasDirectDiv = false;
+          const chs = pre.children;
+          if (chs) {
+            for (let ci = 0; ci < chs.length; ci++) {
+              if (String(chs[ci]?.tagName || '').toUpperCase() === 'DIV') { hasDirectDiv = true; break; }
+            }
+          }
+          if (hasDirectDiv) setAttrIfChanged(pre, 'data-ag-cs-rich-pre', '1');
+          else if (pre.hasAttribute?.('data-ag-cs-rich-pre')) pre.removeAttribute('data-ag-cs-rich-pre');
+          if (recValid && prevRec.stamp === getPreBodyStamp(prevRec.body)) {
+            if (lastResp && !lastResp.contains?.(pre) && !pre.closest?.('[data-testid="artifact-view"]')) {
               prevRec.sealed = true;
             }
             continue;
@@ -588,7 +630,6 @@
             btn.setAttribute('data-lines', String(lineCount));
             btn.setAttribute('aria-expanded', folded ? 'false' : 'true');
             btn.textContent = formatFoldBtnLabel(folded, lineCount);
-            boundFoldBtns.add(btn);
             btn.addEventListener('click', (ev) => {
               ev?.preventDefault?.();
               ev?.stopPropagation?.();
@@ -1212,6 +1253,8 @@
         } catch {}
       }
       pruneUnsubs(iframeUnsubscribers, true, boundIframes);
+      try { iframeRo?.disconnect?.(); } catch {}
+      iframeRo = null;
       pruneUnsubs(navRailUnsubscribers, true, boundNavRails);
 
       if (doc && typeof doc.querySelectorAll === 'function') {
